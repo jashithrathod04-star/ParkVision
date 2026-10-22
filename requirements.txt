@@ -1,0 +1,16 @@
+# --- Web app ---
+streamlit>=1.40,<2.0
+plotly>=5.20,<7.0
+
+# --- Detection ---
+ultralytics>=8.3,<9.0
+opencv-python-headless>=4.10,<5.0
+numpy>=1.26,<3.0
+Pillow>=10.0
+pandas>=2.0
+
+# --- PyTorch (CPU build: small enough for Streamlit Community Cloud) ---
+# Remove these three lines if you want GPU PyTorch on your own Windows PC.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
