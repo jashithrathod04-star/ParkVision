@@ -15,30 +15,49 @@ What makes detection more reliable than a single predict() call:
   * Quality-aware preprocessing (measured sharpness / brightness / contrast / resolution).
 Nothing in this file invents detections, metrics or history; every number comes from the model
 output or from files you provide.
+
+NEW: "ParkVision Reserve" page (see the PARKVISION RESERVE section near the end of this file):
+smart reservations with a BookMyShow-style slot map, vacancy alerts driven by the existing
+detector, and a configurable live camera / device layer. Everything above that section is the
+original application; the few lines touched there are marked with  # [RESERVE].
 """
 from __future__ import annotations
 
+import atexit  # [RESERVE]
 import base64
 import hashlib
 import hmac
 import html as _html
 import io
 import json
+import logging  # [RESERVE]
 import os
 import random
+import re  # [RESERVE]
+import secrets  # [RESERVE]
+import sqlite3  # [RESERVE]
 import tempfile
 import threading
 import time
 import zipfile
-from datetime import datetime
+from contextlib import contextmanager  # [RESERVE]
+from datetime import datetime, timedelta, timezone  # [RESERVE]  (timedelta / timezone added)
+from functools import lru_cache  # [RESERVE]
 from pathlib import Path
+from urllib.parse import urlparse  # [RESERVE]
 
 import cv2
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image, ImageOps
+import streamlit.components.v1 as components  # [RESERVE]
+from PIL import Image, ImageDraw, ImageFont, ImageOps  # [RESERVE]  (ImageDraw / ImageFont added)
+
+try:  # [RESERVE] time zones (tzdata is listed in requirements.txt for Windows)
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 try:  # keep the UI alive (with a clear message) if ultralytics is missing
     from ultralytics import YOLO
@@ -75,10 +94,18 @@ NAV = [
     ("Vision Lab", "◉   Vision Lab"),
     ("Analytics", "▤   Analytics"),
     ("Model Lab", "⬡   Model Lab"),
+    ("ParkVision Reserve", "◈   ParkVision Reserve"),  # [RESERVE]
     ("Export Centre", "⇩   Export Centre"),
 ]
 STAGES = ["Preparing image", "Analysing parking spaces", "Merging detections", "Generating insights"]
-_INFER_LOCK = threading.Lock()
+
+
+@st.cache_resource  # [RESERVE] one lock for the whole server process, so the new camera monitor
+def _shared_infer_lock():  # [RESERVE]  and the Vision Lab never call model.predict() at the same time
+    return threading.Lock()
+
+
+_INFER_LOCK = _shared_infer_lock()  # [RESERVE] (was: threading.Lock())
 
 LOGO_SVG = (
     '<svg viewBox="0 0 48 48" width="40" height="40" xmlns="http://www.w3.org/2000/svg">'
@@ -172,6 +199,10 @@ def go_stage(stage: str) -> None:
 
 
 def logout() -> None:
+    try:  # [RESERVE] release the camera / monitor if this user owns them
+        rv_release_for_user(st.session_state.get("user", ""))
+    except Exception:
+        pass
     for k in ("authed", "user", "analysis", "history", "failures"):
         st.session_state.pop(k, None)
     st.session_state.stage = "welcome"
@@ -1328,10 +1359,11 @@ def sparkline_html(values: list) -> str:
     guides = "".join(f'<line x1="0" x2="{w}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 4"/>' for t in (40, 75))
     dots = "".join(f'<circle cx="{x:.1f}" cy="{y(v):.1f}" r="3.2" fill="#fff" stroke="#38D9FF" stroke-width="1.5"/>' for x, v in zip(xs, values))
     line = f'<polyline class="line" pathLength="1" points="{pts}"/>' if n > 1 else ""
+    poly = f'<polygon class="area" points="{area}"/>' if n > 1 else ""  # [RESERVE] (pre-computed: nested same-quote f-strings need Python 3.12)
     return (f'<svg class="spark" viewBox="0 0 {w:.0f} {h:.0f}" preserveAspectRatio="none"><defs>'
             f'<linearGradient id="spg" x1="0" x2="1"><stop offset="0" stop-color="#38D9FF"/><stop offset="1" stop-color="#9B7BFF"/></linearGradient>'
             f'<linearGradient id="spa" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="rgba(56,217,255,.28)"/><stop offset="1" stop-color="rgba(56,217,255,0)"/></linearGradient></defs>'
-            f'{guides}{f'<polygon class="area" points="{area}"/>' if n > 1 else ""}{line}{dots}</svg>')
+            f'{guides}{poly}{line}{dots}</svg>')
 
 
 def rowbars_html(rows: list, limit: int = 10) -> str:
@@ -1841,6 +1873,2632 @@ def page_export(rcfg, model_file):
 
 
 # =====================================================================================
+# PARKVISION RESERVE  (additive section: reservations, vacancy alerts, camera hub)
+# -------------------------------------------------------------------------------------
+# Nothing above this line was changed in behaviour. This section only READS the existing
+# detector (run_analysis / assign_ids / render_annotated) and never alters it.
+# Three separate ideas are kept apart on purpose:
+#   1. AI-observed occupancy  -> what the camera sees right now (live) or demo data
+#   2. Reservation status     -> rows in SQLite (bookings / holds)
+#   3. Bookable availability  -> slot rules + (1) only when arrival is imminent + (2)
+# =====================================================================================
+log = logging.getLogger("parkvision.reserve")
+
+CURRENCY = "₹"                                   # change to "$", "€" ... if you prefer
+DEFAULT_TZ = os.environ.get("PARKVISION_TZ", "Asia/Kolkata")
+TZ_CHOICES = ["Asia/Kolkata", "UTC", "Europe/London", "Europe/Paris", "America/New_York",
+              "America/Los_Angeles", "Asia/Dubai", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney"]
+_TZ_FIXED_MIN = {"Asia/Kolkata": 330, "UTC": 0, "Europe/London": 0, "Europe/Paris": 60, "America/New_York": -300,
+                 "America/Los_Angeles": -480, "Asia/Dubai": 240, "Asia/Singapore": 480, "Asia/Tokyo": 540,
+                 "Australia/Sydney": 600}  # only used if the tz database is unavailable
+
+BOOKING_WINDOW_H = 24        # arrival must be within this many hours from now
+GRACE_SEC = 120              # tolerated latency between choosing a time and confirming
+HOLD_SECONDS = 300           # a selected slot is held (amber for others) for 5 minutes
+MIN_DURATION_MIN, MAX_DURATION_MIN = 30, 720
+DURATIONS = [30, 60, 90, 120, 180, 240, 360, 480, 600, 720]
+NOW_BLOCK_MIN = 30           # arrival this close to "now": a slot observed occupied cannot be booked
+LIVE_FRESH_SEC = 45          # a camera observation older than this is not used as "live"
+STALE_FRAME_SEC = 8          # camera frames older than this count as "no signal"
+ARM_OBS = 2                  # consecutive "occupied" observations before a slot can raise a vacancy alert
+DISCREPANCY_OBS = 3          # consecutive occupied observations on a reserved, un-checked-in slot
+TAX_RATE = 0.05
+CANCEL_FREE_MIN = 30
+WALK_SPEED_MPS = 1.3
+
+CATEGORIES = ["Shopping malls", "Grocery stores", "Supermarkets", "Office complexes", "Hospitals",
+              "Airports and railway stations", "Other public parking"]
+VEHICLES = {"Car": 1.0, "EV car": 1.0, "Motorbike": 0.5, "Accessible vehicle": 0.8}
+SLOT_TYPES = {"standard": "Standard bay", "covered": "Covered bay", "ev": "EV charging bay", "accessible": "Accessible bay"}
+ELIGIBLE = {"Car": {"standard", "covered"}, "EV car": {"standard", "covered", "ev"},
+            "Motorbike": {"standard", "covered"}, "Accessible vehicle": {"standard", "covered", "accessible"}}
+SURCHARGE_PER_H = {"standard": 0, "covered": 10, "ev": 25, "accessible": 0}   # prototype rates (not real venue pricing)
+FACILITIES = {"standard": ["CCTV coverage"], "covered": ["Roof cover", "CCTV coverage"],
+              "ev": ["EV charger (7 kW, demo)", "CCTV coverage"], "accessible": ["Wider bay", "Step-free route", "CCTV coverage"]}
+SLOT_COLORS = {"green": C_GREEN, "red": C_RED, "cyan": C_CYAN, "grey": "#8FA3BC", "amber": C_AMBER}
+
+# Demo destinations. All names, addresses, capacities and rates are SIMULATED (not real venues).
+LOTS = [
+    dict(id="ORB", name="Orbit Central Mall", cat="Shopping malls", addr="12 Sample Avenue, Demo City", rows=6, cols=14, rate=60, fee=15, cap=420, acc=2, ev=3, covered_rows=(0, 1)),
+    dict(id="SKY", name="Skyline Galleria", cat="Shopping malls", addr="48 Example Road, Demo City", rows=4, cols=12, rate=80, fee=15, cap=560, acc=2, ev=2, covered_rows=(0, 1, 2, 3)),
+    dict(id="FRB", name="FreshBasket Grocery", cat="Grocery stores", addr="5 Market Lane, Demo City", rows=4, cols=10, rate=20, fee=5, cap=100, acc=2, ev=1, covered_rows=()),
+    dict(id="MGM", name="MegaMart Supermarket", cat="Supermarkets", addr="90 Sample Highway, Demo City", rows=6, cols=12, rate=30, fee=10, cap=180, acc=2, ev=2, covered_rows=(0,)),
+    dict(id="VTX", name="Vertex Tech Park", cat="Office complexes", addr="Block C, Demo Business Park", rows=8, cols=14, rate=50, fee=10, cap=400, acc=2, ev=4, covered_rows=(0, 1, 2, 3), restricted=True),
+    dict(id="MER", name="Meridian Towers", cat="Office complexes", addr="1 Example Plaza, Demo City", rows=6, cols=12, rate=70, fee=10, cap=500, acc=2, ev=3, covered_rows=(0, 1, 2, 3, 4, 5), restricted=True),
+    dict(id="AUR", name="St. Aurelia Hospital", cat="Hospitals", addr="22 Care Street, Demo City", rows=6, cols=10, rate=40, fee=5, cap=300, acc=4, ev=2, covered_rows=(0, 1)),
+    dict(id="HCA", name="Harbor City Airport - P2", cat="Airports and railway stations", addr="Terminal Road, Demo City", rows=8, cols=14, rate=120, fee=20, cap=900, acc=3, ev=4, covered_rows=(0, 1, 2, 3)),
+    dict(id="CJN", name="Central Junction Railway Station", cat="Airports and railway stations", addr="Station Approach, Demo City", rows=6, cols=12, rate=40, fee=10, cap=320, acc=2, ev=2, covered_rows=(0,)),
+    dict(id="RIV", name="Riverside Public Garage", cat="Other public parking", addr="7 Riverside Walk, Demo City", rows=4, cols=12, rate=25, fee=5, cap=250, acc=2, ev=2, covered_rows=(0, 1, 2, 3)),
+    dict(id="LIVE-CAM", name="Your Camera Lot (live)", cat="Other public parking", addr="Whatever your connected camera is looking at",
+         rate=30, fee=5, cap=300, live_only=True),
+]
+LOT_BY_ID = {lot["id"]: lot for lot in LOTS}
+
+
+class BookingError(Exception):
+    """A reservation rule was violated (shown to the user as-is)."""
+
+
+# =====================================================================================
+# TIME + MONEY HELPERS
+# =====================================================================================
+def get_tz(name: str):
+    try:
+        if ZoneInfo is not None:
+            return ZoneInfo(name)
+    except Exception:
+        pass
+    return timezone(timedelta(minutes=_TZ_FIXED_MIN.get(name, 0)))
+
+
+def rv_tzname() -> str:
+    try:
+        return st.session_state.get("rv_tz") or DEFAULT_TZ
+    except Exception:
+        return DEFAULT_TZ
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def local_now() -> datetime:
+    return datetime.now(get_tz(rv_tzname()))
+
+
+def fmt_clock(ts, fmt="%H:%M") -> str:
+    return datetime.fromtimestamp(int(ts), get_tz(rv_tzname())).strftime(fmt)
+
+
+def fmt_dt(ts) -> str:
+    return datetime.fromtimestamp(int(ts), get_tz(rv_tzname())).strftime("%a %d %b, %H:%M")
+
+
+def local_to_ts(d, hh: int, mm: int) -> int:
+    return int(datetime(d.year, d.month, d.day, hh, mm, tzinfo=get_tz(rv_tzname())).timestamp())
+
+
+def fmt_dur(mins: int) -> str:
+    h, m = divmod(int(mins), 60)
+    return f"{h} h {m} min" if h and m else (f"{h} h" if h else f"{m} min")
+
+
+def money(cents) -> str:
+    return f"{CURRENCY}{int(cents) / 100:,.2f}"
+
+
+def arrival_options(d, now: int) -> list:
+    """Valid arrival timestamps (15-min steps) on local date d, inside [next quarter hour, now + 24 h]."""
+    earliest = ((now + 899) // 900) * 900
+    latest = now + BOOKING_WINDOW_H * 3600
+    out = []
+    for hh in range(24):
+        for mm in (0, 15, 30, 45):
+            t = local_to_ts(d, hh, mm)
+            if earliest <= t <= latest:
+                out.append(t)
+    return out
+
+
+def validate_window(start: int, end: int, now: int) -> list:
+    errs = []
+    if start < now - GRACE_SEC:
+        errs.append("The arrival time has already passed. Pick a later time.")
+    if start > now + BOOKING_WINDOW_H * 3600:
+        errs.append(f"Reservations can only be made up to {BOOKING_WINDOW_H} hours ahead.")
+    mins = (end - start) / 60
+    if mins < MIN_DURATION_MIN or mins > MAX_DURATION_MIN:
+        errs.append(f"Duration must be between {fmt_dur(MIN_DURATION_MIN)} and {fmt_dur(MAX_DURATION_MIN)}.")
+    return errs
+
+
+# =====================================================================================
+# URL / TEXT REDACTION  (camera credentials must never reach the screen, logs or DB)
+# =====================================================================================
+_URL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*)://([^\s/?#]*)([^\s]*)")
+
+
+def redact_text(s) -> str:
+    def _sub(m):
+        scheme, auth, rest = m.group(1), m.group(2), m.group(3)
+        host = auth.split("@")[-1]
+        return f"{scheme}://{host}" + ("/…" if rest and rest not in ("/",) else "")
+    return _URL_RE.sub(_sub, str(s))
+
+
+def validate_stream_url(url: str):
+    url = (url or "").strip()
+    if not url:
+        return False, "Enter a stream URL."
+    if len(url) > 512 or any(c.isspace() for c in url):
+        return False, "The URL is too long or contains spaces."
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False, "That does not look like a valid URL."
+    if p.scheme.lower() not in ("rtsp", "rtsps", "http", "https"):
+        return False, "Only rtsp://, rtsps://, http:// and https:// streams are supported."
+    if not p.hostname:
+        return False, "The URL has no host name."
+    return True, ""
+
+
+# =====================================================================================
+# SQLITE PERSISTENCE
+# =====================================================================================
+def _pick_db_file() -> Path:
+    env = os.environ.get("PARKVISION_DB")
+    if env:
+        return Path(env)
+    for base in (APP_DIR / "data", Path(tempfile.gettempdir()) / "parkvision"):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            if os.access(base, os.W_OK):
+                return base / "parkvision_reserve.db"
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir()) / "parkvision_reserve.db"
+
+
+_DB_FILE = _pick_db_file()
+_DB_READY = False
+_DB_LOCK = threading.Lock()
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS bookings(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT UNIQUE NOT NULL, uname TEXT NOT NULL, lot_id TEXT NOT NULL,
+  slot_id TEXT NOT NULL, vehicle TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
+  total_cents INTEGER NOT NULL, quote_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'confirmed',
+  created_ts INTEGER NOT NULL, cancelled_ts INTEGER, refund_cents INTEGER, checked_in_ts INTEGER, discrepancy_ts INTEGER);
+CREATE INDEX IF NOT EXISTS ix_b_slot ON bookings(lot_id, slot_id, status, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS ix_b_user ON bookings(uname, status, start_ts);
+CREATE TABLE IF NOT EXISTS holds(
+  lot_id TEXT, slot_id TEXT, uname TEXT, start_ts INTEGER, end_ts INTEGER, expires_ts INTEGER,
+  PRIMARY KEY(lot_id, slot_id, uname));
+CREATE TABLE IF NOT EXISTS anchors(
+  lot_id TEXT, slot_id TEXT, x1 REAL, y1 REAL, x2 REAL, y2 REAL, ref_w INTEGER, ref_h INTEGER,
+  PRIMARY KEY(lot_id, slot_id));
+CREATE TABLE IF NOT EXISTS watches(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, uname TEXT, kind TEXT, lot_id TEXT, slots TEXT, confirm_obs INTEGER,
+  confirm_sec REAL, cooldown_sec REAL, vehicle TEXT, active INTEGER DEFAULT 1, snooze_until INTEGER DEFAULT 0,
+  created_ts INTEGER);
+CREATE TABLE IF NOT EXISTS alerts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, uname TEXT, watch_id INTEGER, kind TEXT, source TEXT,
+  lot_id TEXT, slot_id TEXT, conf REAL, detail TEXT, bookable INTEGER, ack_ts INTEGER, ack_action TEXT);
+CREATE TABLE IF NOT EXISTS observations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lot_id TEXT, ts INTEGER, total INTEGER, occupied INTEGER, empty INTEGER);
+CREATE INDEX IF NOT EXISTS ix_o ON observations(lot_id, ts);
+CREATE TABLE IF NOT EXISTS slot_stats(lot_id TEXT, slot_id TEXT, occ INTEGER DEFAULT 0, emp INTEGER DEFAULT 0,
+  PRIMARY KEY(lot_id, slot_id));
+CREATE TABLE IF NOT EXISTS activity(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, uname TEXT, kind TEXT, msg TEXT);
+"""
+
+
+def _conn(raw: bool = False):
+    if not raw and not _DB_READY:
+        db_init()                       # first use from any thread creates the schema
+    c = sqlite3.connect(str(_DB_FILE), timeout=10, isolation_level=None)  # autocommit; transactions are explicit
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def db_init() -> None:
+    global _DB_READY
+    if _DB_READY:
+        return
+    with _DB_LOCK:
+        if _DB_READY:
+            return
+        c = _conn(raw=True)
+        try:
+            try:
+                c.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            c.executescript(_SCHEMA)
+        finally:
+            c.close()
+        _DB_READY = True
+
+
+def db_q(sql: str, args=()) -> list:
+    c = _conn()
+    try:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+    finally:
+        c.close()
+
+
+def db_x(sql: str, args=()):
+    c = _conn()
+    try:
+        return c.execute(sql, args).lastrowid
+    finally:
+        c.close()
+
+
+@contextmanager
+def db_tx():
+    """BEGIN IMMEDIATE takes the write lock up-front, so conflict checks and the insert are atomic."""
+    c = _conn()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        yield c
+        c.execute("COMMIT")
+    except BaseException:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        c.close()
+
+
+def log_event(kind: str, msg: str, uname: str = "") -> None:
+    """Activity log. Messages are URL-redacted; no footage or personal data is stored."""
+    try:
+        db_x("INSERT INTO activity(ts,uname,kind,msg) VALUES(?,?,?,?)", (now_ts(), uname or "", kind, redact_text(msg)[:400]))
+        db_x("DELETE FROM activity WHERE id < (SELECT COALESCE(MAX(id),0) - 2000 FROM activity)")
+    except Exception:
+        log.exception("activity log write failed")
+
+
+# =====================================================================================
+# PASS SIGNING + QR
+# =====================================================================================
+def _secret() -> bytes:
+    env = os.environ.get("PARKVISION_PASS_SECRET")
+    if env:
+        return env.encode()
+    rows = db_q("SELECT v FROM meta WHERE k='pass_secret'")
+    if not rows:
+        db_x("INSERT OR IGNORE INTO meta(k,v) VALUES('pass_secret',?)", (secrets.token_hex(32),))
+        rows = db_q("SELECT v FROM meta WHERE k='pass_secret'")
+    return rows[0]["v"].encode()
+
+
+def _sign(ref, lot_id, slot_id, start, end) -> str:
+    msg = f"{ref}|{lot_id}|{slot_id}|{start}|{end}".encode()
+    return hmac.new(_secret(), msg, hashlib.sha256).hexdigest()[:12]
+
+
+def pass_payload(b: dict) -> str:
+    return f"PV1|{b['ref']}|{b['lot_id']}|{b['slot_id']}|{b['start_ts']}|{b['end_ts']}|{_sign(b['ref'], b['lot_id'], b['slot_id'], b['start_ts'], b['end_ts'])}"
+
+
+def verify_payload(text: str):
+    """Returns (ok, message, booking_or_None)."""
+    parts = (text or "").strip().split("|")
+    if len(parts) != 7 or parts[0] != "PV1":
+        return False, "Not a ParkVision pass payload.", None
+    _, ref, lot_id, slot_id, s, e, sig = parts
+    try:
+        s, e = int(s), int(e)
+    except ValueError:
+        return False, "Malformed pass.", None
+    if not hmac.compare_digest(sig, _sign(ref, lot_id, slot_id, s, e)):
+        return False, "Signature check failed. This pass was not issued by this system.", None
+    rows = db_q("SELECT * FROM bookings WHERE ref=?", (ref,))
+    if not rows:
+        return False, "Signature is valid but no booking record exists (different database?).", None
+    b = rows[0]
+    st_ = booking_status(b, now_ts())
+    if st_ == "cancelled":
+        return False, f"Booking {ref} was cancelled.", b
+    return True, f"Booking {ref} is valid ({st_}).", b
+
+
+@lru_cache(maxsize=64)
+def make_qr_png(text: str, scale: int = 8):
+    """QR as PNG bytes. Uses OpenCV's built-in encoder (no extra dependency). Each code is read back with
+    OpenCV's decoder and a stronger error-correction level is tried if it does not round-trip; falls back to
+    the optional `qrcode` package, then to the best unverified code."""
+    best = None
+    try:
+        try:
+            params_cls = cv2.QRCodeEncoder.Params
+        except AttributeError:  # older OpenCV naming
+            params_cls = cv2.QRCodeEncoder_Params
+        for ecc in (3, 2, 1):  # H, Q, M
+            prm = params_cls()
+            prm.correction_level = ecc
+            m = cv2.QRCodeEncoder.create(prm).encode(text)
+            if m is None or not m.size:
+                continue
+            big = cv2.resize(m, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+            big = cv2.copyMakeBorder(big, 4 * scale, 4 * scale, 4 * scale, 4 * scale, cv2.BORDER_CONSTANT, value=255)
+            ok, buf = cv2.imencode(".png", big)
+            if not ok:
+                continue
+            if best is None:
+                best = buf.tobytes()
+            if cv2.QRCodeDetector().detectAndDecode(big)[0] == text:
+                return buf.tobytes()
+    except Exception:
+        pass
+    try:
+        import qrcode  # optional
+        img = qrcode.make(text)
+        bio = io.BytesIO()
+        img.save(bio, format="PNG")
+        return bio.getvalue()
+    except Exception:
+        return best
+
+
+def _font(size: int):
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def build_pass_png(b: dict, lot: dict, qr_png) -> bytes:
+    W, Hh = 640, 980
+    img = Image.new("RGB", (W, Hh), (7, 11, 20))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((16, 16, W - 16, Hh - 16), radius=28, outline=(56, 217, 255), width=3, fill=(12, 20, 37))
+    d.text((48, 48), "PARKVISION RESERVE", font=_font(30), fill=(56, 217, 255))
+    d.text((48, 92), "Parking pass (demo - payment simulated)", font=_font(20), fill=(143, 163, 188))
+    if qr_png:
+        qr = Image.open(io.BytesIO(qr_png)).convert("RGB").resize((420, 420))
+        img.paste(qr, ((W - 420) // 2, 150))
+    y = 600
+    for label, val in (("Booking reference", b["ref"]), ("Destination", lot["name"]), ("Slot", f"{b['slot_id']}  ({b['vehicle']})"),
+                       ("Arrival", fmt_dt(b["start_ts"])), ("Departure", fmt_dt(b["end_ts"])), ("Total (simulated)", money(b["total_cents"]))):
+        d.text((48, y), label.upper(), font=_font(16), fill=(143, 163, 188))
+        d.text((48, y + 20), str(val), font=_font(26), fill=(232, 240, 249))
+        y += 58
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+# =====================================================================================
+# LOT LAYOUTS (rows of slots with geometry, so distance and routes are real, not decorative)
+# =====================================================================================
+CELL_M, LANE_M = 2.6, 2.75      # metres per column / per y-unit
+ENT_X, MAIN_X, ENT_Y = -1.5, -0.8, 1.0
+
+
+def _mk_slot(r: int, c: int, sid: str, typ: str, blocked, rowlabel: str) -> dict:
+    p, within = divmod(r, 2)
+    lane_y = p * 3.0 + 1.0
+    y = p * 3.0 + (0.0 if within == 0 else 2.0)
+    dist = ((MAIN_X - ENT_X) * CELL_M + abs(lane_y - ENT_Y) * LANE_M + (c - MAIN_X) * CELL_M + abs(y - lane_y) * LANE_M)
+    route = [(ENT_X, ENT_Y), (MAIN_X, ENT_Y), (MAIN_X, lane_y), (float(c), lane_y), (float(c), y)]
+    return {"id": sid, "row": r, "col": c, "rowlabel": rowlabel, "type": typ, "blocked": blocked,
+            "x": float(c), "y": y, "lane_y": lane_y, "dist_m": round(dist, 1), "route": route}
+
+
+@lru_cache(maxsize=32)
+def _demo_layout(lot_id: str) -> tuple:
+    lot = LOT_BY_ID[lot_id]
+    rows, cols = lot["rows"], lot["cols"]
+    rnd = random.Random(lot_id)
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            typ, blocked = "standard", None
+            if r < 2 and c < lot.get("acc", 2):
+                typ = "accessible"
+            elif r >= rows - 2 and c >= cols - lot.get("ev", 2):
+                typ = "ev"
+            elif r in lot.get("covered_rows", ()):
+                typ = "covered"
+            if typ in ("standard", "covered") and rnd.random() < 0.03:
+                blocked = "Closed for maintenance"
+            if lot.get("restricted") and r == rows - 1 and c < 3:
+                typ, blocked = "standard", "Staff only"
+            out.append(_mk_slot(r, c, f"{chr(65 + r)}{c + 1:02d}", typ, blocked, chr(65 + r)))
+    return tuple(out)
+
+
+def load_anchors(lot_id: str) -> list:
+    return db_q("SELECT * FROM anchors WHERE lot_id=?", (lot_id,))
+
+
+def layout_from_anchors(lot_id: str) -> list:
+    """Layout for the live-camera lot: rows are the horizontal bands of the calibrated boxes."""
+    anchors = load_anchors(lot_id)
+    if not anchors:
+        return []
+    cy = [(a["y1"] + a["y2"]) / 2 for a in anchors]
+    med_h = max(float(np.median([a["y2"] - a["y1"] for a in anchors])), 1.0)
+    bands = sorted({round(v / med_h) for v in cy})
+    out = []
+    for r, band in enumerate(bands):
+        row = sorted([a for a, v in zip(anchors, cy) if round(v / med_h) == band], key=lambda a: a["x1"])
+        for c, a in enumerate(row):
+            out.append(_mk_slot(r, c, a["slot_id"], "standard", None, chr(65 + (r % 26))))
+    return out
+
+
+def get_layout(lot_id: str) -> list:
+    lot = LOT_BY_ID[lot_id]
+    return layout_from_anchors(lot_id) if lot.get("live_only") else list(_demo_layout(lot_id))
+
+
+def get_slot(lot_id: str, slot_id: str):
+    for s in get_layout(lot_id):
+        if s["id"] == slot_id:
+            return s
+    return None
+
+
+# =====================================================================================
+# OBSERVED OCCUPANCY  (live camera if fresh, otherwise clearly-labelled demo data)
+# =====================================================================================
+def observed_map(lot_id: str, now: int | None = None) -> dict:
+    """slot_id -> {status: occupied|empty, src: live|demo, conf}. Live data overrides demo per mapped slot."""
+    now = now or now_ts()
+    lot = LOT_BY_ID[lot_id]
+    out = {}
+    if not lot.get("live_only"):
+        rnd = random.Random(f"{lot_id}:{now // 1800}")
+        rate = random.Random(lot_id).uniform(0.40, 0.93)
+        for s in get_layout(lot_id):
+            out[s["id"]] = {"status": "occupied" if rnd.random() < rate else "empty", "src": "demo", "conf": None}
+    live = get_hub().live_observation(lot_id)
+    if live:
+        for sid, (status, conf) in live["slots"].items():
+            out[sid] = {"status": status, "src": "live", "conf": conf}
+    return out
+
+
+def lot_has_live(lot_id: str) -> bool:
+    return get_hub().live_observation(lot_id) is not None
+
+
+def lot_summary(lot_id: str, now: int | None = None) -> dict:
+    now = now or now_ts()
+    layout = get_layout(lot_id)
+    obs = observed_map(lot_id, now)
+    booked_now = {r["slot_id"] for r in db_q(
+        "SELECT slot_id FROM bookings WHERE lot_id=? AND status='confirmed' AND start_ts<=? AND end_ts>?", (lot_id, now, now))}
+    occ = res = avail = blocked = 0
+    for s in layout:
+        if s["blocked"]:
+            blocked += 1
+            continue
+        o = obs.get(s["id"])
+        if o and o["status"] == "occupied":
+            occ += 1
+        elif s["id"] in booked_now:
+            res += 1
+        else:
+            avail += 1
+    usable = len(layout) - blocked
+    src = "live" if any(o["src"] == "live" for o in obs.values()) else ("demo" if obs else "none")
+    return {"capacity": len(layout), "blocked": blocked, "usable": usable, "occupied": occ, "reserved": res,
+            "available": avail, "occ_pct": (occ + res) / usable * 100 if usable else 0.0, "src": src}
+
+
+def availability_label(sm: dict):
+    if sm["usable"] == 0:
+        return "No data", "vio"
+    frac = sm["available"] / sm["usable"]
+    if sm["available"] == 0:
+        return "Full", "bad"
+    if frac < 0.10:
+        return "Almost full", "bad"
+    if frac < 0.30:
+        return "Filling up", "warn"
+    return "Available", "ok"
+
+
+# =====================================================================================
+# SLOT RULES, STATES, PRICING
+# =====================================================================================
+def slot_rule_error(slot: dict, vehicle: str):
+    if slot is None:
+        return "That slot does not exist."
+    if slot["blocked"]:
+        return f"Slot {slot['id']} is not available ({slot['blocked']})."
+    if slot["type"] not in ELIGIBLE.get(vehicle, set()):
+        return f"{SLOT_TYPES[slot['type']]} {slot['id']} is not available for a {vehicle.lower()}."
+    return None
+
+
+def slot_states(lot_id: str, start: int, end: int, vehicle: str, uname: str, selected) -> dict:
+    """Bookable state per slot for the chosen window: green / red / cyan / grey / amber."""
+    now = now_ts()
+    booked = {r["slot_id"]: r["uname"] for r in db_q(
+        "SELECT slot_id, uname FROM bookings WHERE lot_id=? AND status='confirmed' AND start_ts<? AND end_ts>?", (lot_id, end, start))}
+    held = {r["slot_id"]: r["uname"] for r in db_q(
+        "SELECT slot_id, uname FROM holds WHERE lot_id=? AND uname<>? AND expires_ts>? AND start_ts<? AND end_ts>?",
+        (lot_id, uname, now, end, start))}
+    obs = observed_map(lot_id, now)
+    near_now = start - now <= NOW_BLOCK_MIN * 60
+    out = {}
+    for s in get_layout(lot_id):
+        sid = s["id"]
+        o = obs.get(sid)
+        occ_now = bool(o and o["status"] == "occupied")
+        info = {"state": "green", "reason": "Available to reserve", "occ_now": occ_now, "src": o["src"] if o else None}
+        err = slot_rule_error(s, vehicle)
+        if err:
+            info.update(state="grey", reason=err)
+        elif sid in booked:
+            info.update(state="red", reason="Already booked for an overlapping time" + (" (by you)" if booked[sid] == uname else ""))
+        elif sid in held:
+            info.update(state="amber", reason="Temporarily held by another user while they confirm")
+        elif near_now and occ_now:
+            info.update(state="red", reason=f"Occupied right now ({'live camera' if o['src'] == 'live' else 'demo data'})")
+        elif sid == selected:
+            info.update(state="cyan", reason="Selected by you")
+        elif occ_now:
+            info["reason"] = "Occupied now, but your arrival is later: it may free up"
+        out[sid] = info
+    return out
+
+
+def price_quote(lot: dict, slot: dict, vehicle: str, start: int, end: int) -> dict:
+    units = max(1, -(-int((end - start) // 60) // 30))        # 30-minute billing units, rounded up
+    hours = units / 2
+    base = int(round(lot["rate"] * VEHICLES[vehicle] * hours * 100))
+    base = min(base, int(lot["cap"] * 100))                   # daily cap (prototype)
+    sur = int(round(SURCHARGE_PER_H.get(slot["type"], 0) * hours * 100))
+    fee = int(lot["fee"] * 100)
+    sub = base + sur + fee
+    tax = int(round(sub * TAX_RATE))
+    first_hour = int(round(min(lot["rate"] * VEHICLES[vehicle] * min(hours, 1.0) * 100, lot["cap"] * 100)))
+    lines = [(f"Parking {fmt_dur(units * 30)} @ {CURRENCY}{lot['rate'] * VEHICLES[vehicle]:g}/h", base)]
+    if sur:
+        lines.append((f"{SLOT_TYPES[slot['type']]} surcharge", sur))
+    lines += [("Booking fee", fee), (f"Tax ({TAX_RATE * 100:g}%)", tax)]
+    return {"lines": lines, "base": base, "surcharge": sur, "fee": fee, "tax": tax, "total": sub + tax,
+            "hours": hours, "first_hour": first_hour}
+
+
+def refund_for(b: dict, now: int):
+    """(refund_cents, policy_text). Free cancellation until CANCEL_FREE_MIN before arrival; payment is simulated."""
+    q = json.loads(b["quote_json"])
+    if now <= b["start_ts"] - CANCEL_FREE_MIN * 60:
+        return b["total_cents"], f"Free cancellation (more than {CANCEL_FREE_MIN} min before arrival): full simulated refund."
+    kept = int(round((q["fee"] + q["first_hour"]) * (1 + TAX_RATE)))
+    kept = min(kept, b["total_cents"])
+    return b["total_cents"] - kept, (f"Late cancellation: booking fee and the first hour are kept ({money(kept)}), "
+                                     f"the rest is refunded (simulated).")
+
+
+CANCELLATION_POLICY = (f"Free cancellation up to {CANCEL_FREE_MIN} minutes before arrival. After that, the booking fee and the first "
+                       f"hour are kept. No cancellation after the end time. Payment and refunds are SIMULATED in this prototype.")
+
+
+def booking_status(b: dict, now: int) -> str:
+    if b["status"] == "cancelled":
+        return "cancelled"
+    if now >= b["end_ts"]:
+        return "completed"
+    if now >= b["start_ts"]:
+        return "active"
+    return "upcoming"
+
+
+# =====================================================================================
+# BOOKING / HOLD LOGIC  (all conflict checks run inside one write transaction)
+# =====================================================================================
+def _conflict_error(c, lot_id, slot_id, start, end, uname, now, ignore_own_hold=True):
+    c.execute("DELETE FROM holds WHERE expires_ts<=?", (now,))
+    row = c.execute("SELECT ref FROM bookings WHERE lot_id=? AND slot_id=? AND status='confirmed' AND start_ts<? AND end_ts>?",
+                    (lot_id, slot_id, end, start)).fetchone()
+    if row:
+        return "That slot is already booked for an overlapping time."
+    row = c.execute("SELECT 1 FROM holds WHERE lot_id=? AND slot_id=? AND uname<>? AND start_ts<? AND end_ts>?",
+                    (lot_id, slot_id, uname, end, start)).fetchone()
+    if row:
+        return "That slot is being held by another user right now. Try again in a few minutes or pick another slot."
+    row = c.execute("SELECT ref FROM bookings WHERE uname=? AND status='confirmed' AND start_ts<? AND end_ts>?",
+                    (uname, end, start)).fetchone()
+    if row:
+        return f"You already have a booking ({row['ref']}) that overlaps this time. Cancel it first or choose another time."
+    return None
+
+
+def place_hold(uname, lot_id, slot_id, start, end, vehicle) -> None:
+    now = now_ts()
+    errs = validate_window(start, end, now)
+    if errs:
+        raise BookingError(errs[0])
+    err = slot_rule_error(get_slot(lot_id, slot_id), vehicle)
+    if err:
+        raise BookingError(err)
+    obs = observed_map(lot_id, now).get(slot_id)
+    if start - now <= NOW_BLOCK_MIN * 60 and obs and obs["status"] == "occupied":
+        raise BookingError(f"Slot {slot_id} is occupied right now ({'live camera' if obs['src'] == 'live' else 'demo data'}).")
+    with db_tx() as c:
+        err = _conflict_error(c, lot_id, slot_id, start, end, uname, now)
+        if err:
+            raise BookingError(err)
+        c.execute("DELETE FROM holds WHERE uname=?", (uname,))
+        c.execute("INSERT OR REPLACE INTO holds(lot_id,slot_id,uname,start_ts,end_ts,expires_ts) VALUES(?,?,?,?,?,?)",
+                  (lot_id, slot_id, uname, start, end, now + HOLD_SECONDS))
+
+
+def release_holds(uname: str) -> None:
+    try:
+        db_x("DELETE FROM holds WHERE uname=?", (uname,))
+    except Exception:
+        log.exception("release holds failed")
+
+
+def _new_ref() -> str:
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    return "PV-" + "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def create_booking(uname, lot_id, slot_id, vehicle, start, end) -> dict:
+    now = now_ts()
+    lot = LOT_BY_ID.get(lot_id)
+    if lot is None or vehicle not in VEHICLES:
+        raise BookingError("Unknown destination or vehicle type.")
+    errs = validate_window(start, end, now)
+    if errs:
+        raise BookingError(errs[0])
+    slot = get_slot(lot_id, slot_id)
+    err = slot_rule_error(slot, vehicle)
+    if err:
+        raise BookingError(err)
+    obs = observed_map(lot_id, now).get(slot_id)
+    if start - now <= NOW_BLOCK_MIN * 60 and obs and obs["status"] == "occupied":
+        raise BookingError(f"Slot {slot_id} is occupied right now, so it cannot be reserved for an immediate arrival.")
+    quote = price_quote(lot, slot, vehicle, start, end)
+    for _ in range(5):
+        ref = _new_ref()
+        try:
+            with db_tx() as c:
+                err = _conflict_error(c, lot_id, slot_id, start, end, uname, now)
+                if err:
+                    raise BookingError(err)
+                c.execute("INSERT INTO bookings(ref,uname,lot_id,slot_id,vehicle,start_ts,end_ts,total_cents,quote_json,status,created_ts) "
+                          "VALUES(?,?,?,?,?,?,?,?,?,'confirmed',?)",
+                          (ref, uname, lot_id, slot_id, vehicle, start, end, quote["total"], json.dumps(quote), now))
+                c.execute("DELETE FROM holds WHERE uname=?", (uname,))
+            break
+        except sqlite3.IntegrityError:
+            continue  # ref collision: try another reference
+    else:
+        raise BookingError("Could not allocate a booking reference. Please try again.")
+    log_event("booking", f"Booking {ref} confirmed: {lot['name']} slot {slot_id}, {fmt_dt(start)} to {fmt_dt(end)}", uname)
+    return db_q("SELECT * FROM bookings WHERE ref=?", (ref,))[0]
+
+
+def cancel_booking(uname: str, ref: str):
+    now = now_ts()
+    with db_tx() as c:
+        row = c.execute("SELECT * FROM bookings WHERE ref=? AND uname=?", (ref, uname)).fetchone()
+        if not row:
+            raise BookingError("Booking not found.")
+        b = dict(row)
+        if b["status"] == "cancelled":
+            raise BookingError("This booking is already cancelled.")
+        if now >= b["end_ts"]:
+            raise BookingError("This booking has already finished and cannot be cancelled.")
+        refund, text = refund_for(b, now)
+        c.execute("UPDATE bookings SET status='cancelled', cancelled_ts=?, refund_cents=? WHERE id=?", (now, refund, b["id"]))
+    log_event("booking", f"Booking {ref} cancelled (simulated refund {money(refund)})", uname)
+    return refund, text
+
+
+def check_in(uname: str, ref: str) -> None:
+    now = now_ts()
+    rows = db_q("SELECT * FROM bookings WHERE ref=? AND uname=? AND status='confirmed'", (ref, uname))
+    if not rows:
+        raise BookingError("Booking not found.")
+    b = rows[0]
+    if not (b["start_ts"] - 15 * 60 <= now < b["end_ts"]):
+        raise BookingError("Check-in opens 15 minutes before arrival and closes at the end time.")
+    db_x("UPDATE bookings SET checked_in_ts=? WHERE id=?", (now, b["id"]))
+    log_event("booking", f"Checked in to booking {ref}", uname)
+
+
+def slot_bookable_now(lot_id: str, slot_id: str, vehicle: str, minutes: int = 60) -> bool:
+    """Rules + reservations only (physical occupancy is deliberately not part of this check)."""
+    now = now_ts()
+    if slot_rule_error(get_slot(lot_id, slot_id), vehicle):
+        return False
+    c = _conn()
+    try:
+        c.execute("DELETE FROM holds WHERE expires_ts<=?", (now,))
+        end = now + minutes * 60
+        if c.execute("SELECT 1 FROM bookings WHERE lot_id=? AND slot_id=? AND status='confirmed' AND start_ts<? AND end_ts>?",
+                     (lot_id, slot_id, end, now)).fetchone():
+            return False
+        if c.execute("SELECT 1 FROM holds WHERE lot_id=? AND slot_id=? AND start_ts<? AND end_ts>?",
+                     (lot_id, slot_id, end, now)).fetchone():
+            return False
+        return True
+    finally:
+        c.close()
+
+
+def recommend_slots(lot_id, start, end, vehicle, uname, must: list, priority: str, top: int = 3) -> list:
+    lot = LOT_BY_ID[lot_id]
+    states = slot_states(lot_id, start, end, vehicle, uname, None)
+    need_types = {"EV charging": "ev", "Covered": "covered", "Accessible": "accessible"}
+    wanted = {need_types[m] for m in must}
+    cands = []
+    for s in get_layout(lot_id):
+        if states[s["id"]]["state"] != "green":
+            continue
+        if wanted and s["type"] not in wanted:
+            continue
+        cands.append((s, price_quote(lot, s, vehicle, start, end)))
+    if not cands:
+        return []
+    max_d = max(s["dist_m"] for s, _ in cands) or 1.0
+    max_p = max(q["total"] for _, q in cands) or 1
+    wd, wp = {"Closest": (0.85, 0.15), "Cheapest": (0.15, 0.85)}.get(priority, (0.5, 0.5))
+    scored = sorted(cands, key=lambda sq: wd * sq[0]["dist_m"] / max_d + wp * sq[1]["total"] / max_p)
+    return [{"slot": s, "quote": q} for s, q in scored[:top]]
+
+
+# =====================================================================================
+# WATCHES + ALERTS (persistence)
+# =====================================================================================
+def add_watch(uname, kind, lot_id, slots, confirm_obs, confirm_sec, cooldown_sec, vehicle="Car") -> int:
+    wid = db_x("INSERT INTO watches(uname,kind,lot_id,slots,confirm_obs,confirm_sec,cooldown_sec,vehicle,active,snooze_until,created_ts) "
+               "VALUES(?,?,?,?,?,?,?,?,1,0,?)",
+               (uname, kind, lot_id, json.dumps(slots) if slots != "*" else "*", int(confirm_obs), float(confirm_sec),
+                float(cooldown_sec), vehicle, now_ts()))
+    where = "the whole lot" if slots == "*" else ", ".join(slots)
+    log_event("watch", f"{'Waitlist' if kind == 'waitlist' else 'Vacancy watch'} created for {LOT_BY_ID[lot_id]['name']} ({where})", uname)
+    return wid
+
+
+def list_watches(uname: str) -> list:
+    return db_q("SELECT * FROM watches WHERE uname=? ORDER BY id DESC", (uname,))
+
+
+def watch_slots(w: dict) -> list:
+    if w["slots"] == "*":
+        return [s["id"] for s in get_layout(w["lot_id"]) if not s["blocked"]]
+    try:
+        return list(json.loads(w["slots"]))
+    except Exception:
+        return []
+
+
+def count_active_watches(uname: str) -> int:
+    r = db_q("SELECT COUNT(*) n FROM watches WHERE uname=? AND active=1", (uname,))
+    return int(r[0]["n"]) if r else 0
+
+
+def create_alert(uname, watch_id, kind, source, lot_id, slot_id, conf, detail, bookable) -> int:
+    aid = db_x("INSERT INTO alerts(ts,uname,watch_id,kind,source,lot_id,slot_id,conf,detail,bookable) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (now_ts(), uname, watch_id, kind, source, lot_id, slot_id, conf, detail[:400],
+                None if bookable is None else int(bool(bookable))))
+    log_event("alert", f"{kind.title()} alert{' (DEMO)' if source == 'demo' else ''}: {LOT_BY_ID[lot_id]['name']} slot {slot_id}", uname)
+    return aid
+
+
+def list_alerts(uname: str, unacked_only: bool = False, limit: int = 100) -> list:
+    sql = "SELECT * FROM alerts WHERE uname=?" + (" AND ack_ts IS NULL" if unacked_only else "") + " ORDER BY id DESC LIMIT ?"
+    return db_q(sql, (uname, limit))
+
+
+def count_unacked(uname: str) -> int:
+    r = db_q("SELECT COUNT(*) n FROM alerts WHERE uname=? AND ack_ts IS NULL", (uname,))
+    return int(r[0]["n"]) if r else 0
+
+
+def ack_alert(alert_id: int, action: str) -> None:
+    db_x("UPDATE alerts SET ack_ts=?, ack_action=? WHERE id=?", (now_ts(), action, alert_id))
+
+
+# =====================================================================================
+# VACANCY STATE MACHINE (pure logic: unit-testable, no camera needed)
+# =====================================================================================
+class SlotTrack:
+    """occupied -> checking vacancy -> vacancy confirmed. A missing observation resets the 'checking' run,
+    so one missed vehicle detection can never raise an alert. An alert needs the slot to have been
+    seen occupied (armed) first, then N consecutive 'empty' observations spanning at least T seconds."""
+
+    def __init__(self):
+        self.state = "unknown"      # unknown | occupied | checking | confirmed | empty | unavailable
+        self.occ_run = 0
+        self.armed = False
+        self.empty_run = 0
+        self.empty_since = None
+        self.confs = []
+        self.last_alert = 0.0
+
+    def update(self, status, conf, now, need_obs, need_sec, cooldown, snoozed=False):
+        if status is None:                                   # no detection mapped to this slot this frame
+            self.occ_run = 0
+            self.empty_run, self.empty_since, self.confs = 0, None, []
+            if self.state in ("checking", "unavailable"):
+                self.state = "occupied" if self.armed else "unknown"
+            return None
+        if status == "occupied":
+            self.occ_run += 1
+            self.empty_run, self.empty_since, self.confs = 0, None, []
+            if self.occ_run >= ARM_OBS:
+                self.armed = True
+            self.state = "occupied"
+            return None
+        # status == "empty"
+        self.occ_run = 0
+        if not self.armed:
+            if self.state != "confirmed":
+                self.state = "empty"
+            return None
+        if self.empty_run == 0:
+            self.empty_since = now
+        self.empty_run += 1
+        self.confs.append(float(conf or 0.0))
+        if self.empty_run >= need_obs and (now - self.empty_since) >= need_sec:
+            ev = None
+            self.state = "confirmed"
+            if (now - self.last_alert) >= cooldown and not snoozed:
+                self.last_alert = now
+                ev = {"obs": self.empty_run, "span": now - self.empty_since, "conf": sum(self.confs) / len(self.confs)}
+            self.armed = False                               # needs a vehicle again before the next alert
+            self.empty_run, self.empty_since, self.confs = 0, None, []
+            return ev
+        self.state = "checking"
+        return None
+
+    def mark_unavailable(self):
+        self.state = "unavailable"
+        self.occ_run = 0
+        self.empty_run, self.empty_since, self.confs = 0, None, []
+
+    def snapshot(self):
+        return {"state": self.state, "empty_run": self.empty_run, "armed": self.armed}
+
+
+TRACK_LABEL = {"occupied": ("Occupied", "bad"), "checking": ("Checking vacancy", "warn"), "confirmed": ("Vacancy confirmed", "ok"),
+               "unavailable": ("Monitoring unavailable", "vio"), "empty": ("Empty (alert not armed yet)", "info"),
+               "unknown": ("Waiting for observations", "vio")}
+
+
+# =====================================================================================
+# DETECTION -> LAYOUT MAPPING (configurable slot-mapping layer; the detector itself is untouched)
+# =====================================================================================
+def match_detections(anchors: list, dets: list, size) -> dict:
+    """Assign each calibrated slot the best-overlapping detection: slot_id -> (status, confidence)."""
+    W, Hh = size
+    out = {}
+    usable = [d for d in dets if d["status"] in ("empty", "occupied")]
+    for a in anchors:
+        sx, sy = W / max(a["ref_w"], 1), Hh / max(a["ref_h"], 1)
+        ax1, ay1, ax2, ay2 = a["x1"] * sx, a["y1"] * sy, a["x2"] * sx, a["y2"] * sy
+        area_a = max((ax2 - ax1) * (ay2 - ay1), 1e-9)
+        best, best_score = None, 0.0
+        for d in usable:
+            iw = max(0.0, min(ax2, d["x2"]) - max(ax1, d["x1"]))
+            ih = max(0.0, min(ay2, d["y2"]) - max(ay1, d["y1"]))
+            inter = iw * ih
+            iou = inter / max(area_a + d["w"] * d["h"] - inter, 1e-9)
+            cx, cy = (d["x1"] + d["x2"]) / 2, (d["y1"] + d["y2"]) / 2
+            inside = ax1 <= cx <= ax2 and ay1 <= cy <= ay2
+            if iou >= 0.25 or inside:
+                score = iou + (0.25 if inside else 0.0)
+                if score > best_score:
+                    best, best_score = d, score
+        if best is not None:
+            out[a["slot_id"]] = (best["status"], float(best["confidence"]))
+    return out
+
+
+def save_anchors(lot_id: str, items: list, ref_size) -> None:
+    """items: [(slot_id, (x1,y1,x2,y2))]. Replaces the previous calibration of this lot."""
+    with db_tx() as c:
+        c.execute("DELETE FROM anchors WHERE lot_id=?", (lot_id,))
+        c.executemany("INSERT INTO anchors(lot_id,slot_id,x1,y1,x2,y2,ref_w,ref_h) VALUES(?,?,?,?,?,?,?,?)",
+                      [(lot_id, sid, *map(float, box), int(ref_size[0]), int(ref_size[1])) for sid, box in items])
+        c.execute("DELETE FROM slot_stats WHERE lot_id=?", (lot_id,))
+    log_event("calibration", f"Slot mapping saved for {LOT_BY_ID[lot_id]['name']} ({len(items)} slots)")
+
+
+def derive_live_slot_ids(dets: list) -> dict:
+    """For the live-camera lot: name slots A01.. by horizontal band (row) and x-order. det id -> slot id."""
+    usable = [d for d in dets if d["status"] in ("empty", "occupied")]
+    if not usable:
+        return {}
+    med_h = max(float(np.median([d["h"] for d in usable])), 1.0)
+    bands = sorted({round(((d["y1"] + d["y2"]) / 2) / med_h) for d in usable})
+    out = {}
+    for r, band in enumerate(bands):
+        row = sorted([d for d in usable if round(((d["y1"] + d["y2"]) / 2) / med_h) == band], key=lambda d: d["x1"])
+        for c, d in enumerate(row):
+            out[d["id"]] = f"{chr(65 + (r % 26))}{c + 1:02d}"
+    return out
+
+
+# =====================================================================================
+# CAMERA HUB + MONITOR WORKER (one per server process; created via st.cache_resource)
+# =====================================================================================
+_noop_cb = lambda *a, **k: None
+_PREVIEW_RC = {"disp_conf": 0.0, "show": {"empty": True, "occupied": True, "unknown": True}, "fill": 0.18, "thick": 2,
+               "ids": False, "conf_lbl": False}
+
+
+class CameraHub:
+    """Owns the single camera resource and the single monitor thread. Never touches Streamlit APIs."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.gen = 0
+        self.cfg = None
+        self.status = "disconnected"        # disconnected | connecting | connected | error
+        self.error = ""
+        self.label = ""
+        self.owner = ""
+        self.frame = None
+        self.fid = 0
+        self.last_ok = 0.0
+        self.fps = 0.0
+        self._thread = None
+        self._stop = threading.Event()
+        self.monitor = None
+        self.obs = {}
+        self.tracks = {}
+        self.mon_info = {}
+        self.preview = None
+        self.devices = {"state": "idle", "items": [], "note": ""}
+
+    # ----- connection -----
+    def connect(self, cfg: dict, owner: str) -> None:
+        self.disconnect(quiet=True)
+        with self.lock:
+            self.gen += 1
+            gen = self.gen
+            self.cfg, self.owner, self.label = cfg, owner, cfg["label"]
+            self.status, self.error = "connecting", ""
+            self.frame, self.fid, self.last_ok, self.preview = None, 0, 0.0, None
+            self._stop = threading.Event()
+            if cfg["kind"] == "browser":
+                self.status = "connected"
+            else:
+                self._thread = threading.Thread(target=self._run, args=(cfg, gen, self._stop), daemon=True, name="pv-camera")
+                self._thread.start()
+        log_event("camera", f"Connecting: {cfg['label']}", owner)
+
+    def disconnect(self, quiet: bool = False) -> None:
+        self.stop_monitor()                    # never join threads while holding the lock
+        with self.lock:
+            self.gen += 1                      # invalidates a grabber that is still opening the device
+            self._stop.set()
+            t, was = self._thread, self.status
+            self._thread = None
+        if t is not None:
+            t.join(timeout=3.0)
+        with self.lock:
+            self.status, self.error = "disconnected", ""
+            self.frame, self.preview, self.cfg = None, None, None
+            self.owner, self.label = "", ""
+            self.obs, self.tracks = {}, {}
+        if was != "disconnected" and not quiet:
+            log_event("camera", "Camera disconnected and released")
+
+    def _run(self, cfg, gen, stop):
+        kind, cap = cfg["kind"], None
+        try:
+            if kind == "image":
+                img = cv2.imread(cfg["path"])
+                if img is None:
+                    raise RuntimeError("The image file could not be read.")
+                with self.lock:
+                    if gen != self.gen:
+                        return
+                    self.frame, self.fid, self.last_ok, self.status = img, 1, time.time(), "connected"
+                while not stop.wait(1.0):      # static test image: keep 'last frame' fresh, frame id never changes
+                    with self.lock:
+                        if gen != self.gen:
+                            return
+                        self.last_ok = time.time()
+                return
+            if kind == "local":
+                cap = cv2.VideoCapture(int(cfg["index"]), cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+            elif kind == "ip":
+                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
+                cap = cv2.VideoCapture(cfg["url"], cv2.CAP_FFMPEG)
+            else:
+                cap = cv2.VideoCapture(cfg["path"])
+            if gen != self.gen or stop.is_set():
+                return                          # superseded while opening; `finally` releases the device
+            if not cap.isOpened():
+                raise RuntimeError("The camera or stream could not be opened. Check the device, the URL and the network.")
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            delay = 1.0 / min(max(src_fps, 5.0), 25.0) if kind == "video" else 0.01
+            bad, n, t_fps = 0, 0, time.time()
+            while not stop.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None or getattr(frame, "ndim", 0) != 3 or frame.size == 0:
+                    bad += 1
+                    if kind == "video":
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        if bad > 5:
+                            raise RuntimeError("The video file cannot be decoded.")
+                        continue
+                    if bad > 60:
+                        raise RuntimeError("The camera stopped delivering frames (disconnected?).")
+                    stop.wait(0.1)
+                    continue
+                bad = 0
+                with self.lock:
+                    if gen != self.gen:
+                        return
+                    self.frame, self.last_ok, self.status = frame, time.time(), "connected"
+                    self.fid += 1
+                n += 1
+                if n % 20 == 0:
+                    now = time.time()
+                    self.fps = 20.0 / max(now - t_fps, 1e-6)
+                    t_fps = now
+                stop.wait(delay)
+        except Exception as exc:
+            msg = redact_text(str(exc))[:200]
+            with self.lock:
+                if gen == self.gen:
+                    self.status, self.error = "error", msg
+            log_event("camera", f"Camera error: {msg}")
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+    def push_frame(self, bgr) -> bool:
+        with self.lock:
+            if self.status == "connected" and self.cfg and self.cfg["kind"] == "browser" and bgr is not None and bgr.size:
+                self.frame, self.last_ok = bgr, time.time()
+                self.fid += 1
+                return True
+        return False
+
+    def get_frame(self):
+        with self.lock:
+            return (None if self.frame is None else self.frame.copy()), self.fid, self.last_ok
+
+    # ----- monitoring -----
+    def start_monitor(self, lot_id, model, info, dcfg, interval, owner) -> None:
+        with self.lock:
+            if self.status != "connected":
+                raise RuntimeError("Connect a camera source first.")
+            if self.monitor is not None and self.monitor.is_alive():
+                raise RuntimeError("Monitoring is already running. Stop it first.")
+            self.monitor = MonitorWorker(self, lot_id, model, info, dcfg, interval, owner)
+            self.monitor.start()
+
+    def stop_monitor(self) -> None:
+        with self.lock:
+            m, self.monitor = self.monitor, None
+        if m is not None:
+            m.stop()
+            m.join(timeout=8.0)
+
+    def monitor_running(self) -> bool:
+        m = self.monitor
+        return bool(m is not None and m.is_alive())
+
+    def live_observation(self, lot_id: str):
+        with self.lock:
+            o = self.obs.get(lot_id)
+            if o and self.monitor_running() and self.mon_info.get("lot_id") == lot_id and time.time() - o["ts"] <= LIVE_FRESH_SEC:
+                return o
+        return None
+
+    def shutdown(self) -> None:
+        try:
+            self.disconnect(quiet=True)
+        except Exception:
+            pass
+
+    # ----- device discovery (bounded, background) -----
+    def discover(self, max_index: int = 5) -> None:
+        with self.lock:
+            if self.devices.get("state") == "scanning":
+                return
+            self.devices = {"state": "scanning", "items": [], "note": ""}
+        threading.Thread(target=self._discover, args=(max_index,), daemon=True, name="pv-discover").start()
+
+    def _discover(self, max_index):
+        items, note = [], ""
+        try:
+            if os.name == "posix" and sys_platform() == "linux" and not any(os.path.exists(f"/dev/video{i}") for i in range(max_index)):
+                note = "No camera device nodes were found on the machine running this app."
+            else:
+                for i in range(max_index):
+                    if os.name == "posix" and sys_platform() == "linux" and not os.path.exists(f"/dev/video{i}"):
+                        continue
+                    with self.lock:
+                        in_use = self.cfg and self.cfg.get("kind") == "local" and self.cfg.get("index") == i and self.status in ("connecting", "connected")
+                    if in_use:
+                        items.append({"index": i, "label": f"Camera {i} (in use by this app)", "ok": True})
+                        continue
+                    box = {}
+
+                    def probe(idx=i, box=box):
+                        c = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+                        try:
+                            if c.isOpened():
+                                ok, fr = c.read()
+                                box["res"] = (fr.shape[1], fr.shape[0]) if ok and fr is not None else (0, 0)
+                        finally:
+                            c.release()
+                    t = threading.Thread(target=probe, daemon=True)
+                    t.start()
+                    t.join(timeout=3.0)             # a hung probe is abandoned, never blocks the UI
+                    if "res" in box:
+                        w, h = box["res"]
+                        items.append({"index": i, "label": f"Camera {i}" + (f" ({w}x{h})" if w else ""), "ok": True})
+                if not items:
+                    note = "No working camera was found. On a cloud deployment the server has no webcam: use an IP camera, a test video, or the browser camera."
+        except Exception as exc:
+            note = redact_text(str(exc))[:160]
+        with self.lock:
+            self.devices = {"state": "done", "items": items, "note": note}
+
+
+def sys_platform() -> str:
+    import sys
+    return sys.platform
+
+
+class MonitorWorker(threading.Thread):
+    """Runs the EXISTING detector (run_analysis) on fresh camera frames and feeds the vacancy state machine."""
+
+    def __init__(self, hub, lot_id, model, info, dcfg, interval, owner):
+        super().__init__(daemon=True, name="pv-monitor")
+        self.hub, self.lot_id, self.model, self.info = hub, lot_id, model, info
+        self.dcfg, self.interval, self.owner = dict(dcfg), float(interval), owner
+        self._stop_evt = threading.Event()
+        self.tracks = {}
+        self.occ_runs = {}
+        self._last_obs_write = 0.0
+        hub.mon_info = {"lot_id": lot_id, "started": time.time(), "last_cycle": 0.0, "cycles": 0, "error": "", "ms": 0}
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        hub = self.hub
+        log_event("monitor", f"Monitoring started: {LOT_BY_ID[self.lot_id]['name']} (every {self.interval:g}s, mode {self.dcfg['mode']})", self.owner)
+        last_fid, last_run = -1, 0.0
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    frame, fid, ts = hub.get_frame()
+                    now = time.time()
+                    if frame is None or now - ts > STALE_FRAME_SEC:
+                        self._unavailable("No fresh frames from the camera")
+                        self._stop_evt.wait(1.0)
+                        continue
+                    if fid == last_fid or now - last_run < self.interval:
+                        self._stop_evt.wait(0.2)
+                        continue
+                    last_fid, last_run = fid, now
+                    self._cycle(frame, fid)
+                except Exception as exc:
+                    log.exception("monitor cycle failed")
+                    hub.mon_info["error"] = redact_text(str(exc))[:160]
+                    self._stop_evt.wait(2.0)
+        finally:
+            log_event("monitor", "Monitoring stopped", self.owner)
+
+    def _unavailable(self, why):
+        for t in self.tracks.values():
+            t.mark_unavailable()
+        with self.hub.lock:
+            self.hub.tracks = {}
+            for (wid, sid), t in self.tracks.items():
+                self.hub.tracks.setdefault(wid, {})[sid] = t.snapshot()
+            self.hub.mon_info["error"] = why
+
+    def _cycle(self, bgr, fid):
+        t0 = time.time()
+        hub = self.hub
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        s = MAX_SIDE / max(rgb.shape[:2])
+        if s < 1:
+            rgb = cv2.resize(rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        res = run_analysis(rgb, "camera", f"cam{fid}", self.model, self.info, self.dcfg, _noop_cb)
+        anchors = load_anchors(self.lot_id)
+        obs = match_detections(anchors, res["dets"], res["size"])
+        now = time.time()
+        with hub.lock:
+            hub.obs[self.lot_id] = {"ts": now, "slots": obs, "n_det": len(res["dets"]), "size": res["size"]}
+        # --- vacancy trackers, one per (watch, slot) so each watch keeps its own thresholds ---
+        watches = db_q("SELECT * FROM watches WHERE lot_id=? AND active=1", (self.lot_id,))
+        live_keys, snap = set(), {}
+        for w in watches:
+            for sid in watch_slots(w):
+                key = (w["id"], sid)
+                live_keys.add(key)
+                trk = self.tracks.setdefault(key, SlotTrack())
+                o = obs.get(sid)
+                ev = trk.update(o[0] if o else None, o[1] if o else None, now, w["confirm_obs"], w["confirm_sec"],
+                                w["cooldown_sec"], snoozed=w["snooze_until"] > now)
+                snap.setdefault(w["id"], {})[sid] = trk.snapshot()
+                if ev:
+                    self._fire(w, sid, ev)
+        for key in list(self.tracks):
+            if key not in live_keys:
+                del self.tracks[key]
+        with hub.lock:
+            hub.tracks = snap
+        self._check_discrepancies(obs, now)
+        self._record(obs, now)
+        # --- preview with calibrated slot ids drawn on top ---
+        try:
+            img = render_annotated(res["rgb"], res["dets"], _PREVIEW_RC)
+            sc = max(img.shape[:2]) / 1100.0
+            for a in anchors:
+                sx, sy = img.shape[1] / max(a["ref_w"], 1), img.shape[0] / max(a["ref_h"], 1)
+                cv2.putText(img, a["slot_id"], (int(a["x1"] * sx) + 2, int(a["y2"] * sy) - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            max(0.4, 0.45 * sc), (255, 255, 255), 1, cv2.LINE_AA)
+            k = 960.0 / max(img.shape[:2])
+            if k < 1:
+                img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+            with hub.lock:
+                hub.preview = img
+        except Exception:
+            log.exception("preview render failed")
+        with hub.lock:
+            hub.mon_info.update(last_cycle=now, cycles=hub.mon_info.get("cycles", 0) + 1, error="", ms=int((time.time() - t0) * 1000))
+
+    def _fire(self, w, sid, ev):
+        lot_id = w["lot_id"]
+        detail = (f"Vacancy confirmed after {ev['obs']} consecutive observations over {ev['span']:.0f}s "
+                  f"(mean detector confidence {ev['conf']:.2f}).")
+        if w["kind"] == "waitlist":
+            if not slot_bookable_now(lot_id, sid, w["vehicle"]):
+                log_event("alert", f"Waitlist: slot {sid} is vacant but not bookable for a {w['vehicle'].lower()} (reserved or restricted)", w["uname"])
+                return
+            create_alert(w["uname"], w["id"], "waitlist", "live", lot_id, sid, ev["conf"],
+                         detail + " It has no conflicting reservation, so you can book it now.", True)
+            db_x("UPDATE watches SET active=0 WHERE id=?", (w["id"],))   # one-shot
+        else:
+            bookable = slot_bookable_now(lot_id, sid, w["vehicle"])
+            create_alert(w["uname"], w["id"], "vacancy", "live", lot_id, sid, ev["conf"],
+                         detail + (" It can be reserved." if bookable else " It is reserved or restricted, so it may not be bookable."), bookable)
+
+    def _check_discrepancies(self, obs, now):
+        n = int(now)
+        rows = db_q("SELECT * FROM bookings WHERE lot_id=? AND status='confirmed' AND start_ts<=? AND end_ts>? "
+                    "AND checked_in_ts IS NULL AND discrepancy_ts IS NULL", (self.lot_id, n, n))
+        for b in rows:
+            o = obs.get(b["slot_id"])
+            if o and o[0] == "occupied":
+                self.occ_runs[b["ref"]] = self.occ_runs.get(b["ref"], 0) + 1
+                if self.occ_runs[b["ref"]] >= DISCREPANCY_OBS:
+                    db_x("UPDATE bookings SET discrepancy_ts=? WHERE id=?", (n, b["id"]))
+                    create_alert(b["uname"], None, "discrepancy", "live", self.lot_id, b["slot_id"], o[1],
+                                 f"Your reserved slot {b['slot_id']} (booking {b['ref']}) looks occupied but you have not checked in. "
+                                 f"If it is your vehicle, check in under My Bookings; otherwise verify with the operator. "
+                                 f"The booking was NOT cancelled automatically.", None)
+            else:
+                self.occ_runs[b["ref"]] = 0
+
+    def _record(self, obs, now):
+        if not obs or now - self._last_obs_write < 10:
+            return
+        self._last_obs_write = now
+        occ = sum(1 for v in obs.values() if v[0] == "occupied")
+        with db_tx() as c:
+            c.execute("INSERT INTO observations(lot_id,ts,total,occupied,empty) VALUES(?,?,?,?,?)",
+                      (self.lot_id, int(now), len(obs), occ, len(obs) - occ))
+            c.executemany("INSERT INTO slot_stats(lot_id,slot_id,occ,emp) VALUES(?,?,?,?) "
+                          "ON CONFLICT(lot_id,slot_id) DO UPDATE SET occ=occ+excluded.occ, emp=emp+excluded.emp",
+                          [(self.lot_id, sid, 1 if v[0] == "occupied" else 0, 0 if v[0] == "occupied" else 1) for sid, v in obs.items()])
+
+
+@st.cache_resource
+def get_hub() -> CameraHub:
+    hub = CameraHub()
+    atexit.register(hub.shutdown)        # release the camera when the server process exits
+    return hub
+
+
+def rv_release_for_user(uname: str) -> None:
+    """On sign-out: stop monitoring / release the camera only if this user owns them."""
+    hub = get_hub()
+    if hub.owner and hub.owner == uname:
+        hub.disconnect()
+    release_holds(uname)
+
+
+def monitor_state(hub: CameraHub) -> dict:
+    """Honest status for the UI: never claims monitoring is working when it is not."""
+    with hub.lock:
+        info = dict(hub.mon_info)
+        running = hub.monitor_running()
+        cam = hub.status
+    if not running:
+        return {"code": "off", "text": "Monitoring is not running", "kind": "vio", "info": info}
+    if cam != "connected":
+        return {"code": "unavailable", "text": "Monitoring unavailable: camera not connected", "kind": "bad", "info": info}
+    age = time.time() - info.get("last_cycle", 0) if info.get("last_cycle") else None
+    if age is None:
+        return {"code": "starting", "text": "Monitoring started: waiting for the first detection", "kind": "warn", "info": info}
+    if age > max(20, 4 * hub_interval(hub)):
+        return {"code": "stale", "text": f"Monitoring unavailable: no new observation for {age:.0f}s", "kind": "bad", "info": info}
+    return {"code": "ok", "text": f"Monitoring live (last observation {age:.0f}s ago)", "kind": "ok", "info": info}
+
+
+def hub_interval(hub: CameraHub) -> float:
+    m = hub.monitor
+    return float(m.interval) if m is not None else 2.0
+
+
+# =====================================================================================
+# DEMO SIMULATION (clearly labelled; runs the REAL state machine with virtual time)
+# =====================================================================================
+def simulate_sequence(kind: str, need_obs: int, need_sec: float, cooldown: float = 0.0):
+    """Returns (steps, event). kind: 'real' (vehicle leaves) or 'blip' (a single missed detection)."""
+    trk = SlotTrack()
+    seq = ["occupied"] * 3
+    seq += ["empty"] * (need_obs + 1) if kind == "real" else [None, "occupied", "occupied"]
+    steps, event, t = [], None, 0.0
+    step_dt = max(need_sec / max(need_obs - 1, 1), 0.5) if need_obs > 1 else 1.0
+    for s in seq:
+        ev = trk.update(s, 0.9 if s else None, t, need_obs, need_sec, cooldown)
+        steps.append({"t": round(t, 1), "observation": s or "no detection", "state": TRACK_LABEL[trk.state][0], "alert": bool(ev)})
+        event = event or ev
+        t += step_dt
+    return steps, event
+
+
+# =====================================================================================
+# RESERVE UI: styles, scripts, helpers
+# =====================================================================================
+RV_CSS = """
+.rv-chiprow{display:flex;flex-wrap:wrap;gap:2px;align-items:center}
+.rv-src{display:inline-block;padding:2px 9px;border-radius:7px;font-size:10.5px;font-weight:700;letter-spacing:.08em;border:1px solid}
+.rv-src.demo{color:#FFB84D;border-color:rgba(255,184,77,.5);background:rgba(255,184,77,.08)}
+.rv-src.live{color:#35E69B;border-color:rgba(53,230,155,.55);background:rgba(53,230,155,.10)}
+.rv-card{padding:18px 20px}
+.rv-card h4{font-size:18px;margin:8px 0 2px}
+.rv-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0 10px}
+.rv-stats div{padding:9px 10px;border-radius:12px;border:1px solid var(--line);background:rgba(10,18,34,.55)}
+.rv-stats b{display:block;font-family:'Space Grotesk',sans-serif;font-size:22px;color:#fff}
+.rv-stats span{font-size:11.5px;color:var(--muted)}
+.rv-bar{height:7px;border-radius:9px;background:rgba(255,255,255,.08);overflow:hidden;display:flex}
+.rv-bar i{display:block;height:100%}
+.rv-foot{display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:13px;color:var(--muted);flex-wrap:wrap;gap:6px}
+.rv-lane{height:26px;margin:6px 0;border-radius:8px;display:flex;align-items:center;gap:14px;padding:0 12px;font-size:11px;letter-spacing:.18em;color:rgba(143,163,188,.6);
+ background:repeating-linear-gradient(90deg,rgba(255,255,255,.07) 0 22px,transparent 22px 46px) center/100% 2px no-repeat}
+.rv-lane b{color:#38D9FF;letter-spacing:.12em;background:#0C1425;padding:2px 8px;border-radius:7px;border:1px solid rgba(56,217,255,.35)}
+.rv-gap{height:12px}
+.rv-rowlab{height:46px;display:grid;place-items:center;font-family:'Space Grotesk',sans-serif;font-weight:700;color:#8FA3BC}
+.rv-legend{display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 10px;font-size:12.5px;color:#b7c8de}
+.rv-legend span{display:inline-flex;align-items:center;gap:7px}
+.rv-legend i{width:15px;height:15px;border-radius:5px;border:1.5px solid var(--c);background:var(--b)}
+.rv-sum{display:flex;flex-wrap:wrap;gap:10px;margin:6px 0 4px}
+.rv-sum div{padding:9px 14px;border-radius:12px;border:1px solid var(--line);background:rgba(10,18,34,.6);font-size:12.5px;color:var(--muted)}
+.rv-sum b{font-family:'Space Grotesk',sans-serif;font-size:20px;color:var(--c,#fff);margin-right:6px}
+.rv-price{width:100%;border-collapse:collapse;font-size:14.5px}
+.rv-price td{padding:9px 0;border-bottom:1px solid var(--line);color:#dbe7f5}
+.rv-price td:last-child{text-align:right;color:#fff;font-variant-numeric:tabular-nums}
+.rv-price tr.tot td{border-bottom:0;font-family:'Space Grotesk',sans-serif;font-size:19px;font-weight:700;color:#38D9FF;padding-top:14px}
+.rv-kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 18px;margin-top:8px}
+.rv-kv span{display:block;font-size:11.5px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+.rv-kv b{color:#fff;font-size:15px}
+.rv-note{border-left:3px solid var(--rc,#FFB84D);padding:10px 14px;border-radius:0 12px 12px 0;background:rgba(255,184,77,.07);font-size:13.5px;color:#e6dcc7;line-height:1.55}
+.rv-alert{position:relative;overflow:hidden;display:flex;gap:18px;align-items:center;padding:18px 22px;margin:4px 0 10px;border-radius:20px;border:1px solid rgba(53,230,155,.55);
+ background:linear-gradient(120deg,rgba(14,60,48,.78),rgba(12,20,37,.7));box-shadow:0 0 0 1px rgba(53,230,155,.25),0 0 44px rgba(53,230,155,.22)}
+.rv-alert.disc{border-color:rgba(255,82,107,.6);background:linear-gradient(120deg,rgba(70,16,28,.78),rgba(12,20,37,.7));box-shadow:0 0 0 1px rgba(255,82,107,.3),0 0 44px rgba(255,82,107,.2)}
+.rv-radar{position:relative;flex:0 0 58px;height:58px;border-radius:50%;background:radial-gradient(circle,#35E69B 0 22%,transparent 24%)}
+.rv-alert.disc .rv-radar{background:radial-gradient(circle,#FF526B 0 22%,transparent 24%)}
+.rv-radar::before,.rv-radar::after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid #35E69B;animation:rvping 1.9s ease-out infinite}
+.rv-alert.disc .rv-radar::before,.rv-alert.disc .rv-radar::after{border-color:#FF526B}
+.rv-radar::after{animation-delay:.95s}
+@keyframes rvping{from{transform:scale(.35);opacity:.95}to{transform:scale(1.35);opacity:0}}
+.rv-alert h3{margin:0 0 2px;font-size:19px;letter-spacing:.04em}
+.rv-alert .slot{font-family:'Space Grotesk',sans-serif;font-size:34px;font-weight:700;color:#fff}
+.rv-pass{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:22px;align-items:center}
+@media(max-width:800px){.rv-pass{grid-template-columns:1fr}}
+.rv-pass img{width:100%;border-radius:14px;background:#fff;padding:8px}
+.rv-ref{font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:700;letter-spacing:.06em;color:#38D9FF}
+/* ----- slot buttons: the state lives in the container key, e.g. rvsgreenA01 ----- */
+.st-key-rvgrid{overflow-x:auto;padding:14px 14px 8px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,rgba(12,22,42,.7),rgba(8,14,26,.7));box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.st-key-rvgrid [data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important;gap:6px!important;min-width:max-content}
+.st-key-rvgrid [data-testid="stColumn"],.st-key-rvgrid [data-testid="column"]{min-width:46px!important;flex:1 1 46px!important;width:auto!important}
+.st-key-rvgrid [data-testid="stColumn"]:first-child,.st-key-rvgrid [data-testid="column"]:first-child{flex:0 0 30px!important;min-width:30px!important}
+.stApp [class*="st-key-rvs"] .stButton{width:100%}
+.stApp [class*="st-key-rvs"] button{width:100%;min-height:46px!important;padding:0!important;border-radius:9px!important;font-weight:700!important;transition:transform .15s,box-shadow .2s!important}
+.stApp [class*="st-key-rvs"] button p{font-size:11.5px!important;margin:0!important;letter-spacing:.02em}
+.stApp [class*="st-key-rvs"] button:disabled{opacity:1!important;cursor:not-allowed!important}
+.stApp [class*="st-key-rvsgreen"] button{background:rgba(53,230,155,.10)!important;border:1.5px solid rgba(53,230,155,.85)!important;color:#c9ffe6!important;box-shadow:0 0 12px rgba(53,230,155,.16)!important}
+.stApp [class*="st-key-rvsgreen"] button:hover{background:rgba(53,230,155,.30)!important;box-shadow:0 0 24px rgba(53,230,155,.65)!important;transform:translateY(-2px) scale(1.05)!important}
+.stApp [class*="st-key-rvsred"] button{background:rgba(255,82,107,.14)!important;border:1.5px solid rgba(255,82,107,.7)!important;color:#ffb3bf!important}
+.stApp [class*="st-key-rvscyan"] button{background:rgba(56,217,255,.34)!important;border:2px solid #38D9FF!important;color:#fff!important;animation:rvsel 1.6s ease-in-out infinite}
+.stApp [class*="st-key-rvscyan"] button:hover{transform:scale(1.05)!important}
+@keyframes rvsel{50%{box-shadow:0 0 26px rgba(56,217,255,.85)}}
+.stApp [class*="st-key-rvsgrey"] button{background:rgba(143,163,188,.07)!important;border:1.5px dashed rgba(143,163,188,.35)!important;color:#667a94!important}
+.stApp [class*="st-key-rvsamber"] button{background:rgba(255,184,77,.16)!important;border:1.5px solid rgba(255,184,77,.85)!important;color:#ffe0ad!important;animation:rvhold 2s ease-in-out infinite}
+@keyframes rvhold{50%{opacity:.62}}
+@media(max-width:768px){.rv-kv{grid-template-columns:1fr}.rv-alert{flex-direction:column;align-items:flex-start}}
+"""
+
+_JS_LIB = """
+var P=(function(){try{void window.parent.document;return window.parent;}catch(e){return window;}})();
+var SOUNDS={"Chime":{t:"sine",s:[[880,.18],[1175,.18],[1568,.36]]},
+"Radar ping":{t:"triangle",s:[[1320,.12],[0,.1],[1320,.12],[0,.1],[1980,.32]]},
+"Siren":{t:"sawtooth",s:[[760,.28],[980,.28],[760,.28],[980,.28]]},
+"Beep-beep":{t:"square",s:[[1000,.12],[0,.08],[1000,.12],[0,.08],[1000,.12]]}};
+function ctxOK(){return !!(P.__pvCtx&&P.__pvCtx.state==="running");}
+function unlock(){try{var AC=P.AudioContext||P.webkitAudioContext;if(!P.__pvCtx)P.__pvCtx=new AC();
+return P.__pvCtx.resume().then(function(){return ctxOK();}).catch(function(){return false;});}catch(e){return Promise.resolve(false);}}
+function play(name,vol){if(!ctxOK())return false;var c=P.__pvCtx,s=SOUNDS[name]||SOUNDS["Chime"],t=c.currentTime+0.03;
+var v=Math.max(0.0002,Math.min(1,vol))*0.35;
+s.s.forEach(function(n){var f=n[0],d=n[1];if(f>0){var o=c.createOscillator(),g=c.createGain();o.type=s.t;o.frequency.value=f;
+g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(v,t+0.015);g.gain.exponentialRampToValueAtTime(0.0001,t+d);
+o.connect(g);g.connect(c.destination);o.start(t);o.stop(t+d+0.02);}t+=d;});return true;}
+function notifState(){try{var N=P.Notification;return N?("notifications: "+N.permission):"notifications: not supported";}catch(e){return "notifications: not supported";}}
+"""
+
+_SOUND_PANEL_HTML = """
+<style>body{margin:0;font-family:Inter,system-ui,sans-serif;color:#E8F0F9}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{cursor:pointer;border:1px solid rgba(56,217,255,.55);background:rgba(16,28,52,.9);color:#E8F0F9;border-radius:10px;padding:9px 14px;font-weight:600;font-size:13px}
+button.p{background:linear-gradient(110deg,#1FB6E0,#38D9FF 45%,#9B7BFF);color:#04101c;border:0}
+#s{margin-top:8px;font-size:12.5px;color:#8FA3BC}</style>
+<div class="row"><button class="p" id="en">🔊 ENABLE SOUND</button><button id="te">▶ Test sound</button><button id="nt">🔔 Enable browser notifications</button></div>
+<div id="s"></div>
+<script>(function(){var CFG=__CFG__;__LIB__
+function render(){document.getElementById("s").textContent=(ctxOK()?"🔊 Sound is enabled in this browser tab":"🔇 Sound is OFF: browsers need one click to allow audio")+" · "+notifState();}
+document.getElementById("en").onclick=function(){unlock().then(function(ok){if(ok)play(CFG.name,CFG.vol);render();});};
+document.getElementById("te").onclick=function(){unlock().then(function(ok){if(ok)play(CFG.name,CFG.vol);render();});};
+document.getElementById("nt").onclick=function(){try{P.Notification.requestPermission().then(render);}catch(e){render();}};
+render();})();</script>
+"""
+
+_ALARM_HTML = """
+<style>body{margin:0;font-family:Inter,system-ui,sans-serif}
+button{cursor:pointer;border:0;background:linear-gradient(110deg,#1FB6E0,#38D9FF 45%,#9B7BFF);color:#04101c;border-radius:10px;padding:9px 14px;font-weight:700;font-size:13px}</style>
+<div id="b"></div>
+<script>(function(){var CFG=__CFG__,A=__ALERTS__;__LIB__
+var now=Date.now();P.__pvLast=P.__pvLast||{};var ring=false;
+A.forEach(function(a){var last=P.__pvLast[a.id]||0;if(now-last>CFG.repeat*1000){ring=true;P.__pvLast[a.id]=now;
+if(!last&&CFG.notify){try{var N=P.Notification;if(N&&N.permission==="granted"){new N(a.title+": "+a.slot,{body:a.text});}}catch(e){}}}});
+if(ring&&CFG.sound){play(CFG.name,CFG.vol);}
+var b=document.getElementById("b");
+if(A.length&&CFG.sound&&!ctxOK()){b.innerHTML='<button id="en">🔊 Sound is blocked by the browser: click to enable</button>';
+document.getElementById("en").onclick=function(){unlock().then(function(ok){if(ok)play(CFG.name,CFG.vol);b.innerHTML="";});};}
+try{if(A.length){if(!P.__pvT0)P.__pvT0=P.document.title;P.document.title="🔔 "+A[0].title+" "+A[0].slot+" · ParkVision";}
+else if(P.__pvT0){P.document.title=P.__pvT0;P.__pvT0=null;}}catch(e){}
+})();</script>
+"""
+
+
+def _embed(html: str, height: int = 0) -> None:
+    """components.html wrapper: a failing/removed embed API must never break the page."""
+    try:
+        components.html(html, height=height)
+    except Exception:
+        log.exception("embedded component failed")
+
+
+def _json_js(obj) -> str:
+    return json.dumps(obj).replace("</", "<\\/")
+
+
+def rv_css() -> None:
+    H(f'<div class="pv-css"></div><style>{RV_CSS}</style>')
+
+
+def _fragment(run_every=None):
+    fr = getattr(st, "fragment", None)
+    if fr is None:                                  # very old Streamlit: degrade to a normal function
+        return lambda fn: fn
+    return fr(run_every=run_every)
+
+
+def _sel(label, options, pkey, default, widget="selectbox", **kw):
+    """Select widget whose value survives leaving the page (Streamlit drops widget state when a widget is not rendered)."""
+    ss = st.session_state
+    cur = ss.get(pkey, default)
+    idx = options.index(cur) if cur in options else 0
+    v = (st.radio if widget == "radio" else st.selectbox)(label, options, index=idx, **kw)
+    ss[pkey] = v
+    return v
+
+
+def _chip(text, kind="info", pulse=False) -> str:
+    return f'<span class="chip {kind}{" pulse" if pulse else ""}"><i></i>{esc(text)}</span>'
+
+
+def _src_badge(src) -> str:
+    if src == "live":
+        return '<span class="rv-src live">LIVE CAMERA</span>'
+    return '<span class="rv-src demo">DEMO DATA</span>'
+
+
+def _uname() -> str:
+    return st.session_state.get("user") or "guest"
+
+
+RV_TABS = ["Reserve", "My Bookings", "Vacancy Alerts", "Live Camera & Devices", "Insights & Heatmap", "Activity Log"]
+
+
+def rv_init() -> None:
+    db_init()
+    ss = st.session_state
+    defaults = {"rv_step": "browse", "rv_lot": None, "rv_sel": None, "rv_sig": None, "rv_p_vehicle": "Car", "rv_p_dur": 120,
+                "rv_tz": DEFAULT_TZ, "rv_tab": "Reserve", "rv_p_must": [], "rv_p_prio": "Balanced", "rv_last_ref": None,
+                "rv_snd_on": True, "rv_snd_name": "Chime", "rv_snd_vol": 0.6, "rv_bn_on": False, "rv_snooze_min": 10,
+                "rv_msg": None, "rv_p_cam": None}
+    for k, v in defaults.items():
+        ss.setdefault(k, v)
+
+
+def rv_goto(tab: str) -> None:
+    ss = st.session_state
+    ss["rv_tab"] = tab
+    ss["rv_tab_w"] = tab
+
+
+# =====================================================================================
+# RESERVE FLOW: browse -> pick (slot map) -> review -> done
+# =====================================================================================
+def rv_choose_lot(lot_id: str) -> None:
+    ss = st.session_state
+    release_holds(_uname())
+    ss.update(rv_lot=lot_id, rv_step="pick", rv_sel=None, rv_sig=None)
+
+
+def rv_back_to_browse() -> None:
+    release_holds(_uname())
+    st.session_state.update(rv_step="browse", rv_sel=None, rv_sig=None)
+
+
+def lot_card_html(lot: dict, sm: dict) -> str:
+    label, kind = availability_label(sm)
+    u = max(sm["usable"], 1)
+    bar = (f'<div class="rv-bar"><i style="width:{sm["occupied"] / u * 100:.1f}%;background:{C_RED}"></i>'
+           f'<i style="width:{sm["reserved"] / u * 100:.1f}%;background:{C_AMBER}"></i>'
+           f'<i style="width:{sm["available"] / u * 100:.1f}%;background:{C_GREEN}"></i></div>')
+    if sm["capacity"] == 0:
+        return (f'<div class="glass rv-card"><div class="rv-chiprow">{_chip(lot["cat"], "info")}{_src_badge("live")}</div><h4>{esc(lot["name"])}</h4>'
+                f'<div class="muted" style="font-size:13px">{esc(lot["addr"])}</div>'
+                f'<div class="rv-note" style="margin-top:14px">Not calibrated yet. Connect a camera and map its slots in <b>Live Camera &amp; Devices</b> to create this lot.</div></div>')
+    color = {"ok": C_GREEN, "warn": C_AMBER, "bad": C_RED, "vio": C_VIOLET}[kind]
+    return (f'<div class="glass rv-card"><div class="rv-chiprow">{_chip(lot["cat"], "info")}{_src_badge(sm["src"])}</div>'
+            f'<h4>{esc(lot["name"])}</h4><div class="muted" style="font-size:13px">{esc(lot["addr"])}</div>'
+            f'<div class="rv-stats"><div><b>{sm["capacity"]}</b><span>capacity</span></div>'
+            f'<div><b style="color:{C_RED}">{sm["occupied"]}</b><span>occupied</span></div>'
+            f'<div><b style="color:{color}">{sm["available"]}</b><span>available</span></div></div>{bar}'
+            f'<div class="rv-foot"><span>from {CURRENCY}{lot["rate"]:g}/h · fee {CURRENCY}{lot["fee"]:g}</span>{_chip(label, kind, pulse=kind == "ok")}</div></div>')
+
+
+def rv_browse() -> None:
+    ss = st.session_state
+    H('<div class="sect" style="margin-top:6px">Find a place to park</div>')
+    H(f'<div class="rv-note" style="--rc:{C_AMBER};margin-bottom:12px">Destinations, capacities, occupancy and fees are <b>simulated demo data</b> '
+      f'unless a card says LIVE CAMERA. Reservations are real records in this app\'s database; payment is simulated.</div>')
+    up_ = [r for r in db_q("SELECT ref, end_ts FROM bookings WHERE uname=? AND status='confirmed' AND end_ts>?", (_uname(), now_ts()))]
+    if up_:
+        st.info(f"You have {len(up_)} active or upcoming booking(s). A new booking can't overlap their times; see My Bookings to cancel one.")
+    c1, c2, c3, c4 = st.columns([2, 1.5, 1.2, 1.1])
+    q = c1.text_input("Search destinations", placeholder="Search by name or address", key="rv_q", label_visibility="collapsed")
+    cat = c2.selectbox("Category", ["All categories"] + CATEGORIES, key="rv_cat", label_visibility="collapsed")
+    sort = c3.selectbox("Sort", ["Most available", "Name", "Lowest fee"], key="rv_sort", label_visibility="collapsed")
+    only = c4.toggle("Free spaces only", key="rv_only")
+    now = now_ts()
+    rows = []
+    for lot in LOTS:
+        if cat != "All categories" and lot["cat"] != cat:
+            continue
+        if q and q.lower().strip() not in (lot["name"] + " " + lot["addr"] + " " + lot["cat"]).lower():
+            continue
+        sm = lot_summary(lot["id"], now)
+        if only and sm["available"] == 0:
+            continue
+        rows.append((lot, sm))
+    if sort == "Most available":
+        rows.sort(key=lambda r: -r[1]["available"])
+    elif sort == "Name":
+        rows.sort(key=lambda r: r[0]["name"])
+    else:
+        rows.sort(key=lambda r: r[0]["rate"])
+    if not rows:
+        st.info("No destinations match these filters.")
+        return
+    cols = st.columns(3)
+    for i, (lot, sm) in enumerate(rows):
+        with cols[i % 3]:
+            H(lot_card_html(lot, sm))
+            st.button("Select this destination ▸", key=f"rv_pick_{lot['id']}", type="primary", disabled=sm["capacity"] == 0,
+                      on_click=rv_choose_lot, args=(lot["id"],))
+            st.markdown("")
+
+
+def rv_select_slot(sid: str) -> None:
+    ss = st.session_state
+    uname = _uname()
+    if ss.get("rv_sel") == sid:
+        ss["rv_sel"] = None
+        release_holds(uname)
+        return
+    arr = ss.get("rv_p_arr")
+    try:
+        place_hold(uname, ss["rv_lot"], sid, arr, arr + ss["rv_p_dur"] * 60, ss["rv_p_vehicle"])
+        ss["rv_sel"] = sid
+        ss["rv_flash"] = None
+    except BookingError as exc:
+        ss["rv_sel"] = None
+        ss["rv_flash"] = str(exc)
+
+
+def rv_pick_recommended(sid: str) -> None:
+    st.session_state["rv_sel"] = None
+    rv_select_slot(sid)
+
+
+def route_fig(lot_id: str, states: dict, selected):
+    layout = get_layout(lot_id)
+    fig = go.Figure()
+    for s_name, label in (("green", "Available"), ("red", "Booked / occupied"), ("amber", "Held"), ("grey", "Unavailable")):
+        pts = [s for s in layout if states.get(s["id"], {}).get("state") == s_name]
+        if pts:
+            fig.add_trace(go.Scatter(x=[p["x"] for p in pts], y=[p["y"] for p in pts], mode="markers", name=label, text=[p["id"] for p in pts],
+                                     hovertemplate="%{text}<extra></extra>",
+                                     marker=dict(symbol="square", size=11, color=SLOT_COLORS[s_name], opacity=.85)))
+    if selected:
+        s = get_slot(lot_id, selected)
+        if s:
+            fig.add_trace(go.Scatter(x=[p[0] for p in s["route"]], y=[p[1] for p in s["route"]], mode="lines+markers", name="Route",
+                                     line=dict(color=C_CYAN, width=4, dash="dot"), marker=dict(size=[12, 4, 4, 4, 15], color=C_CYAN)))
+            fig.add_annotation(x=s["route"][0][0], y=s["route"][0][1], text="Entrance", showarrow=False, yshift=16, font=dict(color=C_CYAN, size=12))
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1, showgrid=False, showticklabels=False)
+    fig.update_xaxes(showgrid=False, showticklabels=False)
+    fig.update_layout(title="Entry guidance" if selected else "Lot map")
+    return style_fig(fig, 300)
+
+
+def _rv_map_impl() -> None:
+    ss = st.session_state
+    lot_id, uname = ss["rv_lot"], _uname()
+    lot = LOT_BY_ID[lot_id]
+    arr = ss.get("rv_p_arr")
+    if arr is None:
+        return
+    end, veh = arr + ss["rv_p_dur"] * 60, ss["rv_p_vehicle"]
+    layout = get_layout(lot_id)
+    if not layout:
+        st.info("This lot has no slot layout yet.")
+        return
+    sel = ss.get("rv_sel")
+    states = slot_states(lot_id, arr, end, veh, uname, sel)
+    if sel and states.get(sel, {}).get("state") != "cyan":
+        ss["rv_sel"], sel = None, None
+        release_holds(uname)
+        states = slot_states(lot_id, arr, end, veh, uname, None)
+    flash = ss.get("rv_flash")
+    if flash:
+        st.warning(flash)
+    cnt = {k: sum(1 for v in states.values() if v["state"] == k) for k in ("green", "red", "cyan", "grey", "amber")}
+    usable = max(len(states) - cnt["grey"], 1)
+    has_live = any(v["src"] == "live" for v in states.values())
+    H(f'<div class="rv-sum"><div style="--c:{C_GREEN}"><b>{cnt["green"]}</b>available</div><div style="--c:{C_RED}"><b>{cnt["red"]}</b>booked / occupied</div>'
+      f'<div style="--c:{C_AMBER}"><b>{cnt["amber"]}</b>held</div><div style="--c:#8FA3BC"><b>{cnt["grey"]}</b>unavailable</div>'
+      f'<div style="--c:{C_CYAN}"><b>{cnt["cyan"]}</b>selected</div><div style="--c:#fff"><b>{(usable - cnt["green"] - cnt["cyan"]) / usable * 100:.0f}%</b>utilisation for this window</div>'
+      f'<div>{_src_badge("live" if has_live else "demo")}</div></div>')
+    H('<div class="rv-legend">'
+      f'<span style="--c:{C_GREEN};--b:rgba(53,230,155,.12)"><i></i>Available</span><span style="--c:{C_RED};--b:rgba(255,82,107,.18)"><i></i>Occupied / booked</span>'
+      f'<span style="--c:{C_CYAN};--b:rgba(56,217,255,.4)"><i></i>Your selection</span><span style="--c:#8FA3BC;--b:transparent"><i></i>Unavailable / restricted</span>'
+      f'<span style="--c:{C_AMBER};--b:rgba(255,184,77,.2)"><i></i>Held / awaiting confirmation</span></div>')
+    rows = {}
+    for s in layout:
+        rows.setdefault(s["row"], []).append(s)
+    with st.container(key="rvgrid"):
+        first_lane = True
+        for r in sorted(rows):
+            cols = st.columns([0.45] + [1] * len(rows[r]), gap="small")
+            with cols[0]:
+                H(f'<div class="rv-rowlab">{rows[r][0]["rowlabel"]}</div>')
+            for col, s in zip(cols[1:], rows[r]):
+                stt = states[s["id"]]
+                with col:
+                    with st.container(key=f"rvs{stt['state']}{s['id']}"):
+                        st.button(s["id"], key=f"rvb{s['id']}", disabled=stt["state"] in ("red", "grey", "amber"),
+                                  help=f"{s['id']} · {SLOT_TYPES[s['type']]} · {stt['reason']}", on_click=rv_select_slot, args=(s["id"],))
+            if r % 2 == 0:
+                H(f'<div class="rv-lane">{"<b>ENTRANCE ▸</b>" if first_lane else ""}<span>⟶ ⟶ ⟶ ⟶ ⟶ ⟶</span></div>')
+                first_lane = False
+            else:
+                H('<div class="rv-gap"></div>')
+    left, right = st.columns([1, 1])
+    with left:
+        if sel:
+            s = get_slot(lot_id, sel)
+            q = price_quote(lot, s, veh, arr, end)
+            info = states[sel]
+            fac = " · ".join(FACILITIES[s["type"]])
+            H(f'<div class="glass flat"><div class="rv-chiprow">{_chip("Selected", "info", pulse=True)}{_chip(SLOT_TYPES[s["type"]], "vio")}</div>'
+              f'<div class="rv-ref" style="margin:6px 0 4px">{sel}</div>'
+              f'<div class="rv-kv"><div><span>Status</span><b>Available to reserve</b></div><div><span>Distance from entrance</span><b>{s["dist_m"]:.0f} m (~{s["dist_m"] / WALK_SPEED_MPS:.0f} s walk)</b></div>'
+              f'<div><span>Facilities</span><b>{esc(fac)}</b></div><div><span>Estimated cost</span><b>{money(q["total"])} <small class="muted">(simulated)</small></b></div>'
+              f'<div><span>Arrival</span><b>{fmt_dt(arr)}</b></div><div><span>Departure</span><b>{fmt_dt(end)}</b></div></div>'
+              f'<div class="muted" style="font-size:12.5px;margin-top:10px">Held for you for {HOLD_SECONDS // 60} minutes. '
+              f'{"Currently occupied, but your arrival is later so it may free up. " if info["occ_now"] else ""}</div></div>')
+        else:
+            H('<div class="glass flat"><h4>Pick a green slot</h4><p class="muted" style="font-size:14px;line-height:1.6">Click any green bay to see its details, cost and the walking route. '
+              'Red, amber and grey bays cannot be reserved for this time window. Hover a bay to see why.</p></div>')
+        if st.button("Next: review booking ▸", type="primary", disabled=not sel, key="rv_next"):
+            err = rv_go_review()
+            if err:
+                st.warning(err)
+            else:
+                st.rerun()
+    with right:
+        show_plot(route_fig(lot_id, states, sel), "rv_route")
+
+
+rv_map_static = _fragment(None)(_rv_map_impl)
+rv_map_live = _fragment(5)(_rv_map_impl)       # live camera lots refresh their colours every 5 s
+
+
+def rv_go_review():
+    """Re-validate and refresh the hold, then move to the review step. Returns an error string or None."""
+    ss = st.session_state
+    sel, arr = ss.get("rv_sel"), ss.get("rv_p_arr")
+    if not sel or arr is None:
+        return "Select a slot first."
+    try:
+        place_hold(_uname(), ss["rv_lot"], sel, arr, arr + ss["rv_p_dur"] * 60, ss["rv_p_vehicle"])
+    except BookingError as exc:
+        ss["rv_sel"] = None
+        return str(exc)
+    ss["rv_step"] = "review"
+    return None
+
+
+def rv_pick() -> None:
+    ss = st.session_state
+    lot = LOT_BY_ID[ss["rv_lot"]]
+    uname, now = _uname(), now_ts()
+    sm = lot_summary(lot["id"], now)
+    st.button("◂ All destinations", key="rv_back_browse", on_click=rv_back_to_browse)
+    H(f'<div class="glass flat"><div class="rv-chiprow">{_chip(lot["cat"], "info")}{_src_badge(sm["src"])}</div>'
+      f'<h3 style="margin:6px 0 2px">{esc(lot["name"])}</h3><div class="muted" style="font-size:13.5px">{esc(lot["addr"])} · '
+      f'{sm["available"]} of {sm["usable"]} bays free right now · from {CURRENCY}{lot["rate"]:g}/h</div></div>')
+    if not get_layout(lot["id"]):
+        st.info("This lot has no layout yet. Calibrate the camera first.")
+        return
+    today = local_now().date()
+    tomorrow = today + timedelta(days=1)
+    pdate = ss.get("rv_p_date")
+    if not isinstance(pdate, type(today)) or not (today <= pdate <= tomorrow):
+        pdate = today
+    if "rv_date_w" in ss and (not isinstance(ss["rv_date_w"], type(today)) or not (today <= ss["rv_date_w"] <= tomorrow)):
+        del ss["rv_date_w"]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        d = st.date_input("Date", value=pdate, min_value=today, max_value=tomorrow, key="rv_date_w")
+        ss["rv_p_date"] = d
+    opts = arrival_options(d, now)
+    with c2:
+        if opts:
+            cur = ss.get("rv_p_arr")
+            arr = st.selectbox("Arrival time", opts, index=opts.index(cur) if cur in opts else 0, format_func=lambda t: fmt_clock(t), key=f"rv_arr_w{d}_{opts[0]}_{opts[-1]}")
+            ss["rv_p_arr"] = arr
+        else:
+            arr = None
+            st.selectbox("Arrival time", ["No valid time"], disabled=True, key="rv_arr_none")
+    with c3:
+        dur = _sel("Duration", DURATIONS, "rv_p_dur", 120, key="rv_dur_w", format_func=fmt_dur)
+    with c4:
+        veh = _sel("Vehicle type", list(VEHICLES), "rv_p_vehicle", "Car", key="rv_veh_w")
+    if not opts or arr is None:
+        st.warning(f"No arrival times are left on this date inside the {BOOKING_WINDOW_H}-hour booking window. Pick another date.")
+        return
+    end = arr + dur * 60
+    errs = validate_window(arr, end, now)
+    if errs:
+        st.error(errs[0])
+        return
+    sig = (lot["id"], arr, dur, veh)
+    if ss.get("rv_sig") != sig:                     # window or vehicle changed: the old hold no longer applies
+        ss["rv_sig"], ss["rv_sel"] = sig, None
+        release_holds(uname)
+    H(f'<div class="muted" style="font-size:13px;margin:2px 0 6px">Stay: <b style="color:#fff">{fmt_dt(arr)}</b> to <b style="color:#fff">{fmt_dt(end)}</b> '
+      f'({fmt_dur(dur)}) · times shown in {esc(rv_tzname())} · bookable up to {BOOKING_WINDOW_H} h ahead</div>')
+
+    clash = rv_overlap_rows(uname, arr, end)
+    if clash:
+        c0 = clash[0]
+        st.warning(f"You already have booking {c0['ref']} ({_lot_name(c0['lot_id'])}, slot {c0['slot_id']}, {fmt_dt(c0['start_ts'])} to {fmt_dt(c0['end_ts'])}) "
+                   f"that overlaps this time. A new booking for this window will be rejected. Cancel it in My Bookings or pick a different time.")
+
+    with st.expander("Smart slot recommendations", expanded=False):
+        r1, r2 = st.columns([2, 1.4])
+        must = r1.multiselect("Must have", ["EV charging", "Covered", "Accessible"], default=ss.get("rv_p_must", []), key="rv_must_w")
+        ss["rv_p_must"] = must
+        with r2:
+            prio = _sel("Optimise for", ["Balanced", "Closest", "Cheapest"], "rv_p_prio", "Balanced", widget="radio", horizontal=True, key="rv_prio_w")
+        recs = recommend_slots(lot["id"], arr, end, veh, uname, must, prio)
+        if not recs:
+            st.info("No free slot matches those needs for this window.")
+        for i, r in enumerate(recs):
+            s, q = r["slot"], r["quote"]
+            a, b = st.columns([4, 1])
+            a.markdown(f"**{s['id']}** · {SLOT_TYPES[s['type']]} · {s['dist_m']:.0f} m from the entrance · {money(q['total'])} (simulated)")
+            b.button("Pick", key=f"rv_rec_{i}_{s['id']}", on_click=rv_pick_recommended, args=(s["id"],))
+
+    (rv_map_live if lot_has_live(lot["id"]) else rv_map_static)()
+
+
+def rv_review() -> None:
+    ss = st.session_state
+    uname, now = _uname(), now_ts()
+    lot, sel, arr = LOT_BY_ID.get(ss.get("rv_lot")), ss.get("rv_sel"), ss.get("rv_p_arr")
+    if not lot or not sel or arr is None:
+        ss["rv_step"] = "pick"
+        st.rerun()
+    dur, veh = ss["rv_p_dur"], ss["rv_p_vehicle"]
+    end = arr + dur * 60
+    slot = get_slot(lot["id"], sel)
+    st.button("◂ Back to slot map", key="rv_back_pick", on_click=lambda: st.session_state.update(rv_step="pick"))
+    H('<div class="sect" style="margin-top:6px">Review your reservation</div>')
+    problems = validate_window(arr, end, now) + ([e] if (e := slot_rule_error(slot, veh)) else [])
+    if problems:
+        st.error(problems[0] + " Go back and adjust your selection.")
+        return
+    q = price_quote(lot, slot, veh, arr, end)
+    a, b = st.columns([1.2, 1])
+    with a:
+        H(f'<div class="glass flat"><div class="rv-chiprow">{_chip("Simulated payment", "warn")}{_chip(SLOT_TYPES[slot["type"]], "vio")}</div>'
+          f'<h3 style="margin:6px 0 2px">{esc(lot["name"])}</h3><div class="muted" style="font-size:13px">{esc(lot["addr"])}</div>'
+          f'<div class="rv-kv" style="margin-top:14px"><div><span>Slot</span><b>{sel}</b></div><div><span>Vehicle</span><b>{esc(veh)}</b></div>'
+          f'<div><span>Date</span><b>{fmt_clock(arr, "%a %d %b %Y")}</b></div><div><span>Arrival</span><b>{fmt_clock(arr)}</b></div>'
+          f'<div><span>Duration</span><b>{fmt_dur(dur)}</b></div><div><span>Departure</span><b>{fmt_dt(end)}</b></div></div></div>')
+        H(f'<div class="rv-note" style="margin-top:10px"><b>Cancellation policy.</b> {esc(CANCELLATION_POLICY)}</div>')
+    with b:
+        rows = "".join(f"<tr><td>{esc(lbl)}</td><td>{money(v)}</td></tr>" for lbl, v in q["lines"])
+        H(f'<div class="glass flat"><h4>Price breakdown</h4><table class="rv-price">{rows}<tr class="tot"><td>Total</td><td>{money(q["total"])}</td></tr></table>'
+          f'<div class="muted" style="font-size:12.5px;margin-top:8px">Prototype rates, not real venue pricing. No money is charged.</div></div>')
+    ack = st.checkbox("I understand payment is simulated and no real charge is made.", key="rv_ack")
+    if st.button("Confirm reservation", type="primary", disabled=not ack, key="rv_confirm"):
+        try:
+            b_ = create_booking(uname, lot["id"], sel, veh, arr, end)
+        except BookingError as exc:
+            st.error(str(exc))
+            ss["rv_sel"] = None
+            st.button("Choose another slot", key="rv_choose_other", on_click=lambda: st.session_state.update(rv_step="pick"))
+            return
+        ss.update(rv_last_ref=b_["ref"], rv_step="done", rv_sel=None, rv_sig=None)
+        st.rerun()
+
+
+def rv_done() -> None:
+    ss = st.session_state
+    rows = db_q("SELECT * FROM bookings WHERE ref=? AND uname=?", (ss.get("rv_last_ref"), _uname()))
+    if not rows:
+        ss["rv_step"] = "browse"
+        st.rerun()
+    b = rows[0]
+    lot = LOT_BY_ID[b["lot_id"]]
+    qr = make_qr_png(pass_payload(b))
+    img = f'<img src="data:image/png;base64,{base64.b64encode(qr).decode()}"/>' if qr else '<div class="rv-note">QR code unavailable on this system.</div>'
+    H(f'<div class="glass flat"><div class="rv-pass"><div><div class="rv-chiprow">{_chip("Booking confirmed", "ok", pulse=True)}{_chip("Payment simulated", "warn")}</div>'
+      f'<div class="muted" style="font-size:13px;margin-top:6px">Booking reference</div><div class="rv-ref">{esc(b["ref"])}</div>'
+      f'<div class="rv-kv" style="margin-top:14px"><div><span>Destination</span><b>{esc(lot["name"])}</b></div><div><span>Slot</span><b>{b["slot_id"]} · {esc(b["vehicle"])}</b></div>'
+      f'<div><span>Arrival</span><b>{fmt_dt(b["start_ts"])}</b></div><div><span>Departure</span><b>{fmt_dt(b["end_ts"])}</b></div>'
+      f'<div><span>Total (simulated)</span><b>{money(b["total_cents"])}</b></div><div><span>Status</span><b>Confirmed</b></div></div></div>{img}</div></div>')
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _stretch(st.download_button, "Download pass (PNG)", build_pass_png(b, lot, qr), file_name=f"{b['ref']}_pass.png", mime="image/png", key="rv_dl_pass")
+    with c2:
+        st.button("Book another space", key="rv_again", on_click=lambda: st.session_state.update(rv_step="browse"))
+    with c3:
+        st.button("Open My Bookings", key="rv_to_bookings", type="primary", on_click=rv_goto, args=("My Bookings",))
+
+
+def rv_howto() -> None:
+    """Short in-app guide, always at the top of the Reserve section."""
+    with st.expander("How to reserve a parking space", expanded=not st.session_state.get("rv_seen_howto")):
+        st.session_state["rv_seen_howto"] = True
+        st.markdown(
+            "1. **Choose a destination** from the cards (search, filter by category, or sort by availability).\n"
+            "2. **Set your stay:** date, arrival time (within the next 24 hours), duration and vehicle type.\n"
+            "3. **Pick a bay** on the map: green is free, cyan is yours, red is taken, amber is held by someone else, grey is not available. "
+            "Hover a bay to see why. The details panel shows distance, facilities and cost, and the route map shows the way in.\n"
+            "4. Press **Next**, check the price breakdown and cancellation policy, tick the simulated-payment box and **Confirm**.\n"
+            "5. Download your **QR pass**. Find, cancel or check in to bookings under **My Bookings**.\n"
+            "6. Want to know when a taken bay frees up? Use **Vacancy Alerts**.")
+        st.warning("**One booking at a time:** a new booking is rejected if its time overlaps a booking you already have "
+                   "(one vehicle cannot be in two places). Cancel the existing booking in My Bookings first, or choose a time that starts after it ends.")
+
+
+def rv_overlap_rows(uname: str, start: int, end: int) -> list:
+    return db_q("SELECT ref, lot_id, slot_id, start_ts, end_ts FROM bookings WHERE uname=? AND status='confirmed' AND start_ts<? AND end_ts>?",
+                (uname, end, start))
+
+
+def rv_reserve_tab() -> None:
+    rv_howto()
+    step = st.session_state.get("rv_step", "browse")
+    if step == "pick" and st.session_state.get("rv_lot"):
+        rv_pick()
+    elif step == "review":
+        rv_review()
+    elif step == "done":
+        rv_done()
+    else:
+        rv_browse()
+
+
+# =====================================================================================
+# MY BOOKINGS
+# =====================================================================================
+def rv_do_cancel(ref: str) -> None:
+    try:
+        refund, text = cancel_booking(_uname(), ref)
+        st.session_state["rv_msg"] = ("ok", f"Booking {ref} cancelled. {text} Refund (simulated): {money(refund)}.")
+    except BookingError as exc:
+        st.session_state["rv_msg"] = ("err", str(exc))
+
+
+def rv_do_checkin(ref: str) -> None:
+    try:
+        check_in(_uname(), ref)
+        st.session_state["rv_msg"] = ("ok", f"Checked in to {ref}. Welcome!")
+    except BookingError as exc:
+        st.session_state["rv_msg"] = ("err", str(exc))
+
+
+def rv_bookings_tab() -> None:
+    ss = st.session_state
+    uname, now = _uname(), now_ts()
+    H('<div class="sect" style="margin-top:6px">My bookings</div>')
+    msg = ss.pop("rv_msg", None)
+    if msg:
+        (st.success if msg[0] == "ok" else st.error)(msg[1])
+    rows = db_q("SELECT * FROM bookings WHERE uname=? ORDER BY start_ts DESC LIMIT 30", (uname,))
+    if not rows:
+        empty_state("No bookings yet", "Reserve a space in the Reserve section and it will appear here.")
+    else:
+        flt = st.radio("Show", ["All", "Upcoming", "Active", "Completed", "Cancelled"], horizontal=True, key="rv_bk_filter", label_visibility="collapsed")
+        kind = {"upcoming": "info", "active": "ok", "completed": "vio", "cancelled": "bad"}
+        shown = 0
+        for b in rows:
+            stt = booking_status(b, now)
+            if flt != "All" and stt != flt.lower():
+                continue
+            shown += 1
+            lot = LOT_BY_ID.get(b["lot_id"], {"name": b["lot_id"]})
+            extra = ""
+            if b["checked_in_ts"]:
+                extra += _chip("Checked in", "ok")
+            if b["discrepancy_ts"]:
+                extra += _chip("Occupancy discrepancy flagged", "bad")
+            if stt == "cancelled" and b["refund_cents"] is not None:
+                extra += _chip(f"Refund {money(b['refund_cents'])} (simulated)", "warn")
+            H(f'<div class="glass flat"><div class="rv-chiprow">{_chip(stt.title(), kind[stt], pulse=stt == "active")}{extra}</div>'
+              f'<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><div class="rv-ref" style="font-size:22px">{esc(b["ref"])}</div>'
+              f'<div style="color:#fff;font-weight:600">{esc(lot["name"])} · slot {b["slot_id"]} · {esc(b["vehicle"])}</div>'
+              f'<div class="muted" style="font-size:13px">{fmt_dt(b["start_ts"])} → {fmt_dt(b["end_ts"])}</div></div>'
+              f'<div style="text-align:right"><div class="muted" style="font-size:12px">Total (simulated)</div><b style="font-size:20px;color:#fff">{money(b["total_cents"])}</b></div></div></div>')
+            c1, c2, c3 = st.columns([1, 1, 2])
+            if stt in ("upcoming", "active"):
+                with c1:
+                    refund, _ = refund_for(b, now)
+                    st.button("Cancel booking", key=f"rv_can_{b['ref']}", on_click=rv_do_cancel, args=(b["ref"],), help=f"Simulated refund if cancelled now: {money(refund)}")
+                if not b["checked_in_ts"] and b["start_ts"] - 15 * 60 <= now < b["end_ts"]:
+                    with c2:
+                        st.button("I've arrived: check in", key=f"rv_chk_{b['ref']}", type="primary", on_click=rv_do_checkin, args=(b["ref"],))
+            if stt != "cancelled":
+                with c3:
+                    with st.expander("Show parking pass"):
+                        qr = make_qr_png(pass_payload(b))
+                        if qr:
+                            st.image(qr, width=220)
+                        st.caption("Pass payload: " + pass_payload(b))
+        if flt != "All" and shown == 0:
+            st.info(f"No {flt.lower()} bookings.")
+        st.caption(CANCELLATION_POLICY)
+    with st.expander("Verify a pass (paste the pass payload)"):
+        txt = st.text_input("Pass payload", placeholder="PV1|PV-XXXXXXXX|...", key="rv_verify_txt")
+        if txt:
+            ok, text, _ = verify_payload(txt)
+            (st.success if ok else st.error)(text)
+
+
+# =====================================================================================
+# VACANCY ALERTS TAB
+# =====================================================================================
+SOUND_NAMES = ["Chime", "Radar ping", "Siren", "Beep-beep"]
+
+
+def _lots_with_layout() -> list:
+    return [lot["id"] for lot in LOTS if get_layout(lot["id"])]
+
+
+def _lot_name(lid) -> str:
+    return LOT_BY_ID[lid]["name"] if lid in LOT_BY_ID else str(lid)
+
+
+def _snd_cfg() -> dict:
+    ss = st.session_state
+    return {"sound": bool(ss.get("rv_snd_on", True)), "name": ss.get("rv_snd_name", "Chime"), "vol": float(ss.get("rv_snd_vol", 0.6)),
+            "notify": bool(ss.get("rv_bn_on", False)), "repeat": 8}
+
+
+def rv_watch_toggle(wid: int, active: int) -> None:
+    db_x("UPDATE watches SET active=? WHERE id=?", (active, wid))
+
+
+def rv_watch_delete(wid: int) -> None:
+    db_x("DELETE FROM watches WHERE id=? AND uname=?", (wid, _uname()))
+
+
+def rv_watch_snooze(wid: int) -> None:
+    db_x("UPDATE watches SET snooze_until=? WHERE id=?", (now_ts() + int(st.session_state.get("rv_snooze_min", 10)) * 60, wid))
+
+
+def rv_alerts_tab(model, info, dcfg) -> None:
+    ss, uname, hub = st.session_state, _uname(), get_hub()
+    H('<div class="sect" style="margin-top:6px">Vacancy alerts</div>')
+    ms = monitor_state(hub)
+    lot_txt = f" · {esc(_lot_name(ms['info'].get('lot_id')))}" if ms["code"] != "off" and ms["info"].get("lot_id") else ""
+    H(f'<div class="glass flat"><div class="rv-chiprow">{_chip(ms["text"], ms["kind"], pulse=ms["code"] == "ok")}'
+      f'{_chip("Camera: " + hub.status, {"connected": "ok", "connecting": "warn", "error": "bad"}.get(hub.status, "vio"))}</div>'
+      f'<div class="muted" style="font-size:13.5px;margin-top:6px">Alerts are raised only from real detection updates of a connected camera{lot_txt}. '
+      f'If nothing is being monitored, nothing can alert: start monitoring in <b>Live Camera &amp; Devices</b>. '
+      f'The demo simulator at the bottom is separate and always labelled DEMO.</div></div>')
+    unack = count_unacked(uname)
+    if unack:
+        st.warning(f"{unack} alert(s) are waiting for you at the top of the page. Acknowledge them there.")
+
+    with st.expander("Sound and notifications", expanded=True):
+        c1, c2, c3 = st.columns([1, 1.2, 1.4])
+        ss["rv_snd_on"] = c1.toggle("Sound alarm", value=ss.get("rv_snd_on", True), key="rv_snd_on_w")
+        with c2:
+            _sel("Notification sound", SOUND_NAMES, "rv_snd_name", "Chime", key="rv_snd_name_w")
+        ss["rv_snd_vol"] = c3.slider("Volume", 0.0, 1.0, float(ss.get("rv_snd_vol", 0.6)), 0.05, key="rv_snd_vol_w")
+        c4, c5 = st.columns(2)
+        ss["rv_bn_on"] = c4.toggle("Browser notification when an alert fires", value=ss.get("rv_bn_on", False), key="rv_bn_on_w")
+        ss["rv_snooze_min"] = c5.select_slider("Snooze length (minutes)", options=[5, 10, 15, 30, 60], value=ss.get("rv_snooze_min", 10), key="rv_snooze_w")
+        cfg = _snd_cfg()
+        _embed(_SOUND_PANEL_HTML.replace("__CFG__", _json_js(cfg)).replace("__LIB__", _JS_LIB), height=92)
+        st.caption("Browsers block audio until you click once on the page: press ENABLE SOUND (and, if you want pop-ups, the notifications button). "
+                   "Volume and the chosen sound are applied by your browser. Alerts only sound while this app is open in a tab.")
+
+    with st.expander("Watch slots for a vacancy", expanded=True):
+        lots = _lots_with_layout()
+        lot_id = st.selectbox("Parking lot", lots, format_func=_lot_name, key=f"rv_w_lot{len(lots)}")
+        ids = [s["id"] for s in get_layout(lot_id) if not s["blocked"]]
+        mode = st.radio("What to watch", ["One slot", "Selected slots", "Whole lot"], horizontal=True, key="rv_w_mode")
+        if mode == "One slot":
+            picked = [st.selectbox("Slot", ids, key=f"rv_w_one_{lot_id}")]
+        elif mode == "Selected slots":
+            picked = st.multiselect("Slots", ids, default=ids[:2], key=f"rv_w_many_{lot_id}")
+        else:
+            picked = "*"
+        k1, k2, k3 = st.columns(3)
+        c_obs = k1.slider("Confirm after N consecutive observations", 2, 10, 3, key="rv_w_obs",
+                          help="A space must look empty this many observations in a row. One missed car never raises an alert.")
+        c_sec = k2.slider("Minimum confirmation period (s)", 0, 60, 4, key="rv_w_sec")
+        c_cool = k3.slider("Cooldown between alerts (s)", 30, 3600, 120, 30, key="rv_w_cool")
+        if not hub.monitor_running() or ms["info"].get("lot_id") != lot_id:
+            st.info("This lot is not being monitored right now. The watch is saved, but it can only alert while monitoring runs for this lot.")
+        if st.button("Start watching", type="primary", key="rv_w_add", disabled=(picked != "*" and not picked)):
+            add_watch(uname, "vacancy", lot_id, picked, c_obs, c_sec, c_cool)
+            st.success("Watch created. A slot arms itself after it has been seen occupied, then alerts when it is confirmed vacant.")
+
+    watches = list_watches(uname)
+    H('<div class="sect">Your watches</div>')
+    if not watches:
+        st.caption("No watches yet.")
+    snap = hub.tracks if ms["code"] == "ok" else {}
+    for w in watches:
+        slots = watch_slots(w)
+        now = now_ts()
+        flags = _chip("Waitlist" if w["kind"] == "waitlist" else "Vacancy watch", "vio")
+        flags += _chip("Active" if w["active"] else "Paused", "ok" if w["active"] else "warn")
+        if w["snooze_until"] > now:
+            flags += _chip(f"Snoozed {(w['snooze_until'] - now) // 60 + 1} min", "warn")
+        detail = ("whole lot" if w["slots"] == "*" else ", ".join(slots)) + f" · confirm {w['confirm_obs']} obs / {w['confirm_sec']:g}s · cooldown {w['cooldown_sec']:g}s"
+        chips = ""
+        if not w["active"]:
+            chips = ""
+        elif ms["code"] != "ok" or hub.monitor is None or ms["info"].get("lot_id") != w["lot_id"]:
+            chips = _chip("Monitoring unavailable", "vio")
+        else:
+            tr = snap.get(w["id"], {})
+            for sid in slots[:16]:
+                t = tr.get(sid)
+                lab, kind = TRACK_LABEL[t["state"]] if t else TRACK_LABEL["unknown"]
+                chips += _chip(f"{sid}: {lab}", kind)
+            if len(slots) > 16:
+                chips += f'<span class="muted" style="font-size:12px">+{len(slots) - 16} more slots</span>'
+        H(f'<div class="glass flat"><div class="rv-chiprow">{flags}</div><b style="color:#fff">{esc(_lot_name(w["lot_id"]))}</b>'
+          f'<div class="muted" style="font-size:13px;margin:2px 0 8px">{esc(detail)}</div><div class="rv-chiprow">{chips}</div></div>')
+        a, b, c, _ = st.columns([1, 1, 1, 2])
+        a.button("Pause" if w["active"] else "Resume", key=f"rv_wt_{w['id']}", on_click=rv_watch_toggle, args=(w["id"], 0 if w["active"] else 1))
+        b.button("Snooze", key=f"rv_ws_{w['id']}", on_click=rv_watch_snooze, args=(w["id"],))
+        c.button("Remove", key=f"rv_wd_{w['id']}", on_click=rv_watch_delete, args=(w["id"],))
+
+    with st.expander("Smart waitlist: tell me when a suitable space frees up"):
+        lots = _lots_with_layout()
+        wl_lot = st.selectbox("Parking lot", lots, format_func=_lot_name, key=f"rv_wl_lot{len(lots)}")
+        wl_veh = st.selectbox("Vehicle type", list(VEHICLES), key="rv_wl_veh")
+        sm = lot_summary(wl_lot)
+        label, kind = availability_label(sm)
+        H(f'<div class="rv-chiprow">{_chip(label, kind)}{_src_badge(sm["src"])}</div>'
+          f'<div class="muted" style="font-size:13px">{sm["available"]} of {sm["usable"]} bays look free. When a bay is confirmed vacant, '
+          f'it is checked against reservations and holds before you are told it is bookable.</div>')
+        if st.button("Join waitlist", key="rv_wl_join"):
+            add_watch(uname, "waitlist", wl_lot, "*", 3, 4, 60, wl_veh)
+            st.success("Waitlist active. It is one-shot: you will be notified once, then it switches off.")
+
+    H('<div class="sect">Alert history</div>')
+    hist = list_alerts(uname, limit=50)
+    if hist:
+        df = pd.DataFrame([{"time": fmt_clock(a["ts"], "%d %b %H:%M:%S"), "type": a["kind"], "source": a["source"].upper(), "lot": _lot_name(a["lot_id"]),
+                            "slot": a["slot_id"], "confidence": None if a["conf"] is None else round(a["conf"], 2),
+                            "bookable": {1: "yes", 0: "no"}.get(a["bookable"], "-"), "status": a["ack_action"] or "waiting"} for a in hist])
+        show_df(df)
+    else:
+        st.caption("No alerts yet.")
+
+    with st.expander("DEMO simulator: try the alarm without a camera"):
+        st.caption("This feeds made-up observations through the same vacancy state machine, using virtual time. Alerts it creates are marked DEMO.")
+        lots = _lots_with_layout()
+        s_lot = st.selectbox("Lot", lots, format_func=_lot_name, key=f"rv_sim_lot{len(lots)}")
+        s_slot = st.selectbox("Slot", [s["id"] for s in get_layout(s_lot) if not s["blocked"]], key=f"rv_sim_slot_{s_lot}")
+        n_obs, n_sec = ss.get("rv_w_obs", 3), ss.get("rv_w_sec", 4)
+        c1, c2 = st.columns(2)
+        run = None
+        if c1.button("Simulate: vehicle really leaves", key="rv_sim_real"):
+            run = "real"
+        if c2.button("Simulate: one missed detection (must NOT alert)", key="rv_sim_blip"):
+            run = "blip"
+        if run:
+            steps, ev = simulate_sequence(run, n_obs, n_sec)
+            show_df(pd.DataFrame(steps))
+            if ev:
+                create_alert(uname, None, "vacancy", "demo", s_lot, s_slot, ev["conf"],
+                             f"DEMO: vacancy confirmed after {ev['obs']} consecutive simulated observations over {ev['span']:.0f}s.",
+                             slot_bookable_now(s_lot, s_slot, "Car"))
+                st.success("The state machine confirmed the vacancy and raised an alert (see the banner at the top of the page).")
+                st.rerun()
+            else:
+                st.info("No alert was raised, as expected: a single missing detection does not confirm a vacancy.")
+
+
+# =====================================================================================
+# LIVE CAMERA & DEVICES TAB
+# =====================================================================================
+CAM_KINDS = ["Built-in webcam", "External USB webcam", "IP camera (RTSP / HTTP)", "Uploaded image or video (test)", "Browser camera (snapshot)"]
+
+
+def _frame_rgb(bgr, max_side=960):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    s = max_side / max(rgb.shape[:2])
+    return cv2.resize(rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else rgb
+
+
+def _rv_cam_status_impl(build_status: str) -> None:
+    hub = get_hub()
+    with hub.lock:
+        status, err, label, last, fps = hub.status, hub.error, hub.label, hub.last_ok, hub.fps
+        frame, preview, cfg = hub.frame, hub.preview, hub.cfg
+        owner = hub.owner
+    if status != build_status:
+        st.rerun()                                      # state changed: re-evaluate polling and controls
+    kind = {"connected": "ok", "connecting": "warn", "error": "bad"}.get(status, "vio")
+    age = f"{time.time() - last:.1f}s ago" if last else "never"
+    chips = _chip(f"Status: {status}", kind, pulse=status == "connected")
+    if label:
+        chips += _chip(f"Source: {label}", "info")
+    if last:
+        chips += _chip(f"Last frame: {fmt_clock(last, '%H:%M:%S')} ({age})", "ok" if time.time() - last < STALE_FRAME_SEC else "bad")
+    if frame is not None:
+        chips += _chip(f"{frame.shape[1]}x{frame.shape[0]}" + (f" · {fps:.0f} fps" if fps and cfg and cfg["kind"] not in ("image", "browser") else ""), "vio")
+    if owner:
+        chips += _chip(f"Owner: {owner}", "vio")
+    H(f'<div class="glass flat"><div class="rv-chiprow">{chips}</div></div>')
+    if err:
+        st.error(err)
+    img = preview if (preview is not None and get_hub().monitor_running()) else (None if frame is None else _frame_rgb(frame))
+    if img is not None:
+        show_image(img, caption="Live preview with detections" if preview is not None and get_hub().monitor_running() else "Latest frame")
+    elif status == "connected":
+        st.info("Connected, waiting for the first frame…")
+
+
+rv_cam_status_static = _fragment(None)(_rv_cam_status_impl)
+rv_cam_status_live = _fragment(1.5)(_rv_cam_status_impl)
+
+
+def rv_calibration(model, info, dcfg) -> None:
+    ss, hub = st.session_state, get_hub()
+    H('<div class="sect">Slot mapping (calibration)</div>')
+    st.caption("The detector finds parking spaces but does not know their names. Calibration stores where each named slot sits in the camera view, "
+               "so a detection can be matched to slot B07 frame after frame. The detector itself is not modified.")
+    lots_all = [lot["id"] for lot in LOTS]
+    c1, c2 = st.columns([1.3, 1.5])
+    lot_id = c1.selectbox("Map this camera to lot", lots_all, index=lots_all.index("LIVE-CAM"), format_func=_lot_name, key="rv_cal_lot")
+    src = c2.radio("Reference image", ["Current camera frame", "Last Vision Lab analysis"], horizontal=True, key="rv_cal_src")
+    if st.button("Detect slots in the reference image", key="rv_cal_run"):
+        res = None
+        if src.startswith("Current"):
+            frame, _, _ = hub.get_frame()
+            if frame is None:
+                st.error("No camera frame yet. Connect a source first.")
+            else:
+                with st.spinner("Running the detector…"):
+                    res = run_analysis(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), "calibration", "cal", model, info, dcfg, _noop_cb)
+        else:
+            res = ss.get("analysis")
+            if res is None:
+                st.error("There is no Vision Lab analysis yet. Analyse an image there first.")
+        if res is not None:
+            dets = [d for d in res["dets"] if d["status"] in ("empty", "occupied")]
+            if lot_id == "LIVE-CAM":
+                mp = derive_live_slot_ids(dets)
+                slot_of = [mp.get(d["id"], "(ignore)") for d in dets]
+            else:
+                ids = [s["id"] for s in get_layout(lot_id) if not s["blocked"]]
+                slot_of = [ids[i] if i < len(ids) else "(ignore)" for i in range(len(dets))]
+            table = pd.DataFrame({"Detection": [d["id"] for d in dets], "Detected state": [d["status"] for d in dets],
+                                  "Confidence": [d["confidence"] for d in dets], "Layout slot": slot_of})
+            ss["rv_calib"] = {"lot": lot_id, "size": res["size"], "dets": dets, "table": table,
+                              "img": render_annotated(res["rgb"], res["dets"], {**_PREVIEW_RC, "ids": True})}
+            ss.pop("rv_cal_editor", None)
+    cal = ss.get("rv_calib")
+    if cal and cal["lot"] == lot_id:
+        show_image(cal["img"], caption=f"{len(cal['dets'])} detections. IDs (S01…) are matched to layout slots in reading order; fix the table if the order is wrong.")
+        ids = [s["id"] for s in get_layout(lot_id) if not s["blocked"]]
+        if lot_id != "LIVE-CAM" and len(cal["dets"]) != len(ids):
+            st.warning(f"{len(cal['dets'])} detections vs {len(ids)} layout slots. Review the mapping below; unmatched detections are ignored.")
+        live_lot = lot_id == "LIVE-CAM"
+        cc = {} if live_lot else {"Layout slot": st.column_config.SelectboxColumn("Layout slot", options=ids + ["(ignore)"], required=True)}
+        edited = st.data_editor(cal["table"], hide_index=True, key="rv_cal_editor", column_config=cc,
+                                disabled=["Detection", "Detected state", "Confidence"] + (["Layout slot"] if live_lot else []))
+        if st.button("Save slot mapping", type="primary", key="rv_cal_save"):
+            by_id = {d["id"]: d for d in cal["dets"]}
+            chosen = [(r["Layout slot"], r["Detection"]) for _, r in edited.iterrows() if r["Layout slot"] != "(ignore)"]
+            names = [c[0] for c in chosen]
+            if not chosen:
+                st.error("Nothing to save: every detection is set to (ignore).")
+            elif len(set(names)) != len(names):
+                st.error("Each layout slot can be used only once. Fix the duplicates and save again.")
+            else:
+                save_anchors(lot_id, [(sid, (by_id[did]["x1"], by_id[did]["y1"], by_id[did]["x2"], by_id[did]["y2"])) for sid, did in chosen], cal["size"])
+                st.success(f"Saved {len(chosen)} slot positions for {_lot_name(lot_id)}.")
+    anchors = load_anchors(lot_id)
+    st.caption(f"{_lot_name(lot_id)}: {len(anchors)} calibrated slots.")
+
+
+def rv_camera_tab(model, info, dcfg) -> None:
+    ss, hub, uname = st.session_state, get_hub(), _uname()
+    H('<div class="sect" style="margin-top:6px">Live camera and devices</div>')
+    H('<div class="rv-note" style="--rc:#38D9FF">The camera is opened by the <b>machine running this app</b>. On Streamlit Cloud that server has no webcam, '
+      'so use an IP camera, a test video/image, or the browser camera (snapshots). To use a USB or built-in webcam, run the app locally. '
+      'Frames stay in memory: nothing is uploaded or saved.</div>')
+    blocked = bool(hub.owner and hub.owner != uname and hub.status != "disconnected")
+    if blocked:
+        st.warning(f"The camera is currently in use by '{hub.owner}'. Ask them to disconnect it first.")
+    kind = _sel("Camera source", CAM_KINDS, "rv_p_cam", CAM_KINDS[0], widget="radio", key="rv_cam_w")
+    idx, url, up, shot = 0, "", None, None
+    if kind in CAM_KINDS[:2]:
+        default_idx = 0 if kind == CAM_KINDS[0] else 1
+        c1, c2 = st.columns([1, 2])
+        c1.button("Scan for cameras", key="rv_scan", on_click=lambda: get_hub().discover())
+        dev = hub.devices
+        if dev["state"] == "scanning":
+            c2.info("Scanning (bounded to a few seconds)… press any button to refresh the list.")
+        if dev["items"]:
+            nums = [i["index"] for i in dev["items"]]
+            idx = c2.selectbox("Detected devices", nums, index=nums.index(default_idx) if default_idx in nums else 0,
+                               format_func=lambda n: next(x["label"] for x in dev["items"] if x["index"] == n), key=f"rv_dev_{default_idx}_{'_'.join(map(str, nums))}")
+        else:
+            idx = c2.number_input("Device index (0 is usually the built-in camera)", 0, 9, default_idx, key=f"rv_idx_{default_idx}")
+            if dev["note"]:
+                c2.caption(dev["note"])
+    elif kind == CAM_KINDS[2]:
+        url = st.text_input("Stream URL (hidden while typing)", type="password", placeholder="rtsp://user:pass@192.168.1.20:554/stream", key="rv_ip_url",
+                            help="rtsp://, rtsps://, http:// or https://. Credentials are never shown, logged or stored.")
+        st.caption("Only the host is ever displayed. Credentials stay in memory for the connection and are never written to the log or database.")
+    elif kind == CAM_KINDS[3]:
+        up = st.file_uploader("Test image or video", type=["jpg", "jpeg", "png", "bmp", "webp", "mp4", "avi", "mov", "mkv", "webm"], key="rv_cam_up")
+        st.caption("A video is looped, so it behaves like a live camera. A single image gives only one observation, which cannot confirm a vacancy.")
+    else:
+        shot = st.camera_input("Take a snapshot with your browser camera", key="rv_cam_shot")
+        st.caption("The browser camera gives snapshots, not a continuous stream. Each snapshot you push counts as one observation.")
+
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("Connect", type="primary", disabled=blocked, key="rv_connect"):
+        cfg, err = None, None
+        if kind in CAM_KINDS[:2]:
+            cfg = {"kind": "local", "index": int(idx), "label": f"Local camera {int(idx)}"}
+        elif kind == CAM_KINDS[2]:
+            ok, msg = validate_stream_url(url)
+            if ok:
+                cfg = {"kind": "ip", "url": url.strip(), "label": redact_text(url.strip())}
+            else:
+                err = msg
+        elif kind == CAM_KINDS[3]:
+            if up is None:
+                err = "Choose a file first."
+            else:
+                data = up.getvalue()
+                suffix = Path(up.name).suffix.lower() or ".bin"
+                path = Path(tempfile.gettempdir()) / f"pv_cam_{hashlib.md5(data).hexdigest()[:10]}{suffix}"
+                path.write_bytes(data)
+                cfg = {"kind": "image" if suffix in (".jpg", ".jpeg", ".png", ".bmp", ".webp") else "video", "path": str(path), "label": f"Test file: {up.name}"}
+        else:
+            cfg = {"kind": "browser", "label": "Browser camera (snapshots)"}
+        if err:
+            st.error(err)
+        elif cfg:
+            hub.connect(cfg, uname)
+            st.rerun()
+    if b2.button("Disconnect", disabled=hub.status == "disconnected" or blocked, key="rv_disconnect"):
+        hub.disconnect()
+        st.rerun()
+    b3.button("Refresh preview", key="rv_refresh")
+    if kind == CAM_KINDS[4]:
+        if b4.button("Use this snapshot", disabled=shot is None or hub.status != "connected", key="rv_push_shot",
+                     help="Connect first, then push the snapshot as an observation."):
+            img = cv2.imdecode(np.frombuffer(shot.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+            if img is None or not hub.push_frame(img):
+                st.error("Could not use that snapshot. Make sure the browser camera source is connected.")
+            else:
+                st.success("Snapshot received.")
+
+    (rv_cam_status_live if hub.status in ("connecting", "connected") else rv_cam_status_static)(hub.status)
+
+    rv_calibration(model, info, dcfg)
+
+    H('<div class="sect">Monitoring</div>')
+    ms = monitor_state(hub)
+    H(f'<div class="rv-chiprow">{_chip(ms["text"], ms["kind"], pulse=ms["code"] == "ok")}</div>')
+    cal_lots = [lot["id"] for lot in LOTS if load_anchors(lot["id"])]
+    if not cal_lots:
+        st.info("Calibrate at least one lot above before starting monitoring.")
+        return
+    m1, m2, m3 = st.columns(3)
+    mon_lot = m1.selectbox("Lot to monitor", cal_lots, format_func=_lot_name, key="rv_mon_lot_" + "_".join(cal_lots))
+    interval = m2.slider("Seconds between detections", 1.0, 10.0, 2.0, 0.5, key="rv_mon_int")
+    mode = m3.selectbox("Detection mode while monitoring", ["Fast", "Accurate"], key="rv_mon_mode",
+                        help="Uses your sidebar settings with this mode. Fast is one pass per frame.")
+    s1, s2, _ = st.columns([1, 1, 2])
+    if s1.button("Start monitoring", type="primary", disabled=hub.monitor_running() or hub.status != "connected" or blocked, key="rv_mon_start"):
+        try:
+            hub.start_monitor(mon_lot, model, info, {**dcfg, "mode": mode}, interval, uname)
+            st.rerun()
+        except RuntimeError as exc:
+            st.error(str(exc))
+    if s2.button("Stop monitoring", disabled=not hub.monitor_running() or blocked, key="rv_mon_stop"):
+        hub.stop_monitor()
+        st.rerun()
+    if hub.monitor_running():
+        mi = hub.mon_info
+        st.caption(f"{mi.get('cycles', 0)} detection cycles · last cycle {mi.get('ms', 0)} ms" + (f" · {mi['error']}" if mi.get("error") else ""))
+
+
+# =====================================================================================
+# INSIGHTS, HEATMAP, ACTIVITY
+# =====================================================================================
+def heat_matrix(lot_id: str):
+    """Returns (rows, cols, matrix of occupancy 0..1, text, is_demo, n_obs)."""
+    layout = get_layout(lot_id)
+    stats = {r["slot_id"]: r for r in db_q("SELECT * FROM slot_stats WHERE lot_id=?", (lot_id,))}
+    n_obs = sum(r["occ"] + r["emp"] for r in stats.values())
+    demo = n_obs < 20
+    nr, nc = max(s["row"] for s in layout) + 1, max(s["col"] for s in layout) + 1
+    z = [[None] * nc for _ in range(nr)]
+    txt = [[""] * nc for _ in range(nr)]
+    rnd = random.Random(f"heat{lot_id}")
+    max_d = max(s["dist_m"] for s in layout) or 1.0
+    base = random.Random(lot_id).uniform(0.40, 0.93)
+    for s in layout:
+        if s["blocked"]:
+            continue
+        r = stats.get(s["id"])
+        if not demo and r and (r["occ"] + r["emp"]) > 0:
+            v = r["occ"] / (r["occ"] + r["emp"])
+        elif demo:
+            v = min(0.98, max(0.05, base + 0.25 * (1 - s["dist_m"] / max_d) - 0.1 + rnd.uniform(-0.12, 0.12)))
+        else:
+            continue
+        z[s["row"]][s["col"]] = v
+        txt[s["row"]][s["col"]] = s["id"]
+    return nr, nc, z, txt, demo, n_obs
+
+
+def rv_insights_tab() -> None:
+    H('<div class="sect" style="margin-top:6px">Occupancy insights</div>')
+    lots = _lots_with_layout()
+    lot_id = st.selectbox("Parking lot", lots, format_func=_lot_name, key=f"rv_in_lot{len(lots)}")
+    sm = lot_summary(lot_id)
+    c = st.columns(4)
+    for col, (lab, v, note, colr, suf, dec) in zip(c, [
+            ("Total spaces", sm["capacity"], f"{sm['blocked']} closed or restricted", C_CYAN, "", 0),
+            ("Occupied now", sm["occupied"], "Observed (live or demo)", C_RED, "", 0),
+            ("Available now", sm["available"], f"{sm['reserved']} reserved right now", C_GREEN, "", 0),
+            ("Occupancy", sm["occ_pct"], "Occupied + reserved of usable", C_VIOLET, "%", 1)]):
+        with col:
+            H(kpi(lab, v, note, colr, suf, dec))
+    H(f'<div style="margin-top:8px">{_src_badge(sm["src"])}</div>')
+    a, b = st.columns([1.5, 1])
+    with a:
+        nr, nc, z, txt, demo, n_obs = heat_matrix(lot_id)
+        fig = go.Figure(go.Heatmap(z=z, text=txt, texttemplate="%{text}", x=list(range(1, nc + 1)), y=[chr(65 + (i % 26)) for i in range(nr)],
+                                   zmin=0, zmax=1, colorscale=[[0, "#1f8f66"], [0.5, "#FFB84D"], [1, "#FF526B"]], colorbar=dict(title="Occupied", tickformat=".0%"),
+                                   hovertemplate="%{text}: %{z:.0%} occupied<extra></extra>", xgap=3, ygap=3))
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(title="Parking heatmap: how often each bay is occupied")
+        show_plot(style_fig(fig, 150 + 46 * nr), "rv_heat")
+        H(f'<div class="rv-note">{"<b>DEMO DATA.</b> Not enough real observations yet (" + str(n_obs) + "), so this is a simulated pattern." if demo else f"<b>Real observations:</b> built from {n_obs} slot observations recorded by live monitoring."}</div>')
+    with b:
+        obs = observed_map(lot_id)
+        rows = {}
+        for s in get_layout(lot_id):
+            if s["blocked"] or s["id"] not in obs:
+                continue
+            r = rows.setdefault(s["rowlabel"], [0, 0])
+            r[0 if obs[s["id"]]["status"] == "empty" else 1] += 1
+        if rows:
+            labels = [f"Row {k}" for k in rows]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=labels, x=[v[0] for v in rows.values()], name="Free", orientation="h", marker_color=C_GREEN))
+            fig.add_trace(go.Bar(y=labels, x=[v[1] for v in rows.values()], name="Occupied", orientation="h", marker_color=C_RED))
+            fig.update_layout(barmode="stack", title="Availability by row now")
+            fig.update_yaxes(autorange="reversed")
+            show_plot(style_fig(fig, max(240, 30 * len(rows) + 120)), "rv_rows")
+    hist = db_q("SELECT ts, total, occupied FROM observations WHERE lot_id=? ORDER BY ts DESC LIMIT 400", (lot_id,))[::-1]
+    if len(hist) >= 2:
+        fig = go.Figure(go.Scatter(x=[datetime.fromtimestamp(h["ts"], get_tz(rv_tzname())) for h in hist],
+                                   y=[h["occupied"] / max(h["total"], 1) * 100 for h in hist], mode="lines", line=dict(color=C_CYAN, width=3), fill="tozeroy",
+                                   fillcolor="rgba(56,217,255,.12)"))
+        fig.update_layout(title="Occupancy trend from live observations", yaxis=dict(range=[0, 100], title="Occupancy %"))
+        show_plot(style_fig(fig, 300), "rv_trend")
+    else:
+        hours = list(range(24))
+        base = random.Random(lot_id).uniform(0.4, 0.9)
+        y = [round(100 * min(0.98, max(0.1, base * (0.55 + 0.45 * np.sin((h - 7) / 24 * 2 * np.pi * 1.0) ** 2))), 1) for h in hours]
+        fig = go.Figure(go.Scatter(x=hours, y=y, mode="lines", line=dict(color=C_AMBER, width=3, dash="dot")))
+        fig.update_layout(title="Typical day (DEMO DATA)", xaxis_title="Hour of day", yaxis=dict(range=[0, 100], title="Occupancy %"))
+        show_plot(style_fig(fig, 280), "rv_trend_demo")
+        st.caption("No live observations recorded for this lot yet, so the typical-day curve above is simulated and labelled as demo data.")
+
+
+def rv_activity_tab() -> None:
+    H('<div class="sect" style="margin-top:6px">Activity log</div>')
+    st.caption("Bookings, cancellations, alerts and camera events. No footage and no personal data beyond your username is stored. Camera URLs are redacted.")
+    kinds = ["booking", "alert", "camera", "monitor", "watch", "calibration"]
+    sel = st.multiselect("Event types", kinds, default=kinds, key="rv_act_kinds")
+    rows = db_q("SELECT ts, uname, kind, msg FROM activity ORDER BY id DESC LIMIT 300")
+    rows = [r for r in rows if r["kind"] in sel and (not r["uname"] or r["uname"] == _uname() or r["kind"] in ("camera", "monitor", "calibration"))]
+    if not rows:
+        st.info("No matching events yet.")
+        return
+    df = pd.DataFrame([{"time": fmt_clock(r["ts"], "%d %b %H:%M:%S"), "user": r["uname"], "type": r["kind"], "event": r["msg"]} for r in rows])
+    show_df(df)
+    _stretch(st.download_button, "Download log (CSV)", df.to_csv(index=False).encode("utf-8"), file_name="parkvision_activity.csv", mime="text/csv", key="rv_act_dl")
+
+
+# =====================================================================================
+# GLOBAL ALERT CENTER (rendered above every page while watches are active or alerts wait)
+# =====================================================================================
+def rv_alert_action(alert_id: int, action: str, watch_id) -> None:
+    ack_alert(alert_id, action)
+    if watch_id and action == "snooze":
+        db_x("UPDATE watches SET snooze_until=? WHERE id=?", (now_ts() + int(st.session_state.get("rv_snooze_min", 10)) * 60, watch_id))
+    if watch_id and action == "disable":
+        db_x("UPDATE watches SET active=0 WHERE id=?", (watch_id,))
+
+
+def _alert_titles(a: dict):
+    if a["kind"] == "discrepancy":
+        return "RESERVATION DISCREPANCY", "Discrepancy"
+    if a["kind"] == "waitlist":
+        return "WAITLIST: A SPACE JUST FREED UP", "Waitlist"
+    return "VACANCY CONFIRMED", "Vacancy"
+
+
+def _rv_alert_center_impl() -> None:
+    ss, uname = st.session_state, _uname()
+    alerts = list_alerts(uname, unacked_only=True, limit=3)
+    snd = _snd_cfg()
+    if alerts:
+        ss["rv_had_alert"] = True
+        rv_css()
+        for a in alerts:
+            title, short = _alert_titles(a)
+            bk = {1: "Bookable right now: yes", 0: "Bookable right now: no (reserved or restricted)"}.get(a["bookable"], "")
+            conf = f" · confidence {a['conf']:.2f}" if a["conf"] is not None else ""
+            demo = '<span class="rv-src demo" style="margin-left:8px">DEMO</span>' if a["source"] == "demo" else ""
+            H(f'<div class="rv-alert {"disc" if a["kind"] == "discrepancy" else ""}"><div class="rv-radar"></div><div style="flex:1;min-width:0">'
+              f'<h3>{title}{demo}</h3><div class="slot">{esc(a["slot_id"])} <span style="font-size:15px;font-weight:500;color:#cfe3f7">· {esc(_lot_name(a["lot_id"]))}</span></div>'
+              f'<div style="color:#cfe3f7;font-size:14px;margin-top:2px">Detected at {fmt_clock(a["ts"], "%H:%M:%S")}{conf} {("· " + bk) if bk else ""}</div>'
+              f'<div class="muted" style="font-size:13px;margin-top:4px">{esc(a["detail"])}</div></div></div>')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.button("Acknowledge", key=f"al_ack_{a['id']}", type="primary", on_click=rv_alert_action, args=(a["id"], "acknowledged", None))
+            c2.button(f"Snooze {ss.get('rv_snooze_min', 10)} min", key=f"al_snz_{a['id']}", on_click=rv_alert_action, args=(a["id"], "snoozed", a["watch_id"]),
+                      disabled=not a["watch_id"])
+            c3.button("Dismiss", key=f"al_dis_{a['id']}", on_click=rv_alert_action, args=(a["id"], "dismissed", None))
+            c4.button("Disable alerts", key=f"al_off_{a['id']}", on_click=rv_alert_action, args=(a["id"], "disabled", a["watch_id"]), disabled=not a["watch_id"])
+        payload = [{"id": a["id"], "slot": a["slot_id"], "title": _alert_titles(a)[1], "text": f"{_lot_name(a['lot_id'])} at {fmt_clock(a['ts'], '%H:%M:%S')}"} for a in alerts]
+        _embed(_ALARM_HTML.replace("__CFG__", _json_js(snd)).replace("__ALERTS__", _json_js(payload)).replace("__LIB__", _JS_LIB),
+                        height=52 if snd["sound"] else 0)
+    elif ss.pop("rv_had_alert", False):
+        _embed(_ALARM_HTML.replace("__CFG__", _json_js(snd)).replace("__ALERTS__", "[]").replace("__LIB__", _JS_LIB), height=0)
+
+
+rv_alert_static = _fragment(None)(_rv_alert_center_impl)
+rv_alert_live = _fragment(3)(_rv_alert_center_impl)
+
+
+def rv_alert_center() -> None:
+    uname = _uname()
+    if count_active_watches(uname) > 0:
+        rv_alert_live()
+    elif count_unacked(uname) > 0 or st.session_state.get("rv_had_alert"):
+        rv_alert_static()
+
+
+# =====================================================================================
+# PAGE
+# =====================================================================================
+def page_reserve(model, info, dcfg, rcfg) -> None:
+    rv_css()
+    H('<div class="page-title">ParkVision Reserve</div>'
+      '<div class="page-sub">Pick a destination, choose a bay on the live-style map, and get a pass. Vacancy alerts and the camera layer reuse your existing detector.</div>')
+    tzs = TZ_CHOICES if DEFAULT_TZ in TZ_CHOICES else [DEFAULT_TZ] + TZ_CHOICES
+    c1, c2 = st.columns([3, 1.2])
+    with c2:
+        _sel("Time zone", tzs, "rv_tz", DEFAULT_TZ, key="rv_tz_w")
+    with c1:
+        hub = get_hub()
+        H(f'<div class="rv-chiprow" style="margin-top:6px">{_chip("Local time " + local_now().strftime("%a %d %b, %H:%M"), "info")}'
+          f'{_chip("Camera: " + hub.status, {"connected": "ok", "connecting": "warn", "error": "bad"}.get(hub.status, "vio"))}'
+          f'{_chip("Booking window: " + str(BOOKING_WINDOW_H) + " h", "vio")}{_chip("Payment simulated", "warn")}</div>')
+    tab = _sel("Section", RV_TABS, "rv_tab", "Reserve", widget="radio", horizontal=True, key="rv_tab_w", label_visibility="collapsed")
+    if tab == "Reserve":
+        rv_reserve_tab()
+    elif tab == "My Bookings":
+        rv_bookings_tab()
+    elif tab == "Vacancy Alerts":
+        rv_alerts_tab(model, info, dcfg)
+    elif tab == "Live Camera & Devices":
+        rv_camera_tab(model, info, dcfg)
+    elif tab == "Insights & Heatmap":
+        rv_insights_tab()
+    else:
+        rv_activity_tab()
+
+
+# =====================================================================================
 # MAIN
 # =====================================================================================
 def page_missing_model():
@@ -1881,6 +4539,13 @@ def main():
         st.exception(exc)
         return
 
+    try:  # [RESERVE] database + vacancy alert banner (shown above every page while alerts are pending)
+        rv_init()
+        rv_alert_center()
+    except Exception as exc:
+        log.exception("Reserve module failed to initialise")
+        st.warning(f"ParkVision Reserve could not start ({type(exc).__name__}). The rest of the app is unaffected.")
+
     page = st.session_state.page
     if page == "Dashboard":
         page_dashboard(info, path.name, rcfg)
@@ -1890,6 +4555,8 @@ def main():
         page_analytics(rcfg)
     elif page == "Model Lab":
         page_model(model, info, path.name)
+    elif page == "ParkVision Reserve":  # [RESERVE]
+        page_reserve(model, info, dcfg, rcfg)
     else:
         page_export(rcfg, path.name)
     st.markdown("")
